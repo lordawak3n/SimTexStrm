@@ -1,0 +1,31 @@
+# Unreal Engine generated folders
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# Visual Studio / IDE
+.vs/
+.vscode/
+*.VC.db
+*.VC.opendb
+*.suo
+*.opensdf
+*.sdf
+*.user
+*.userprefs
+*.sln.docstates
+
+# Build and temporary logs
+*.log
+*.tlog
+*.tmp
+*.cache
+
+# Keep source/config/content and project descriptors
+!Config/
+!Content/
+!Source/
+!Plugins/
+!*.uproject
+!*.uplugin

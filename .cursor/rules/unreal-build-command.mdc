@@ -1,0 +1,56 @@
+---
+description: Build game (BuildGame.cmd) and optionally launch editor (LaunchProject.cmd) — kept separate
+alwaysApply: true
+---
+
+# Build game / run game
+
+When the user asks to **build game** or **run game** (or clearly equivalent phrasing like **compile the game** for this project), run **`BuildGame.cmd`**—**do not** chain **`LaunchProject.cmd`** unless they explicitly ask to **build and launch** or **open the editor after building**.
+
+**Build** (from the `SimTextureStrm` folder in PowerShell):
+
+```powershell
+.\BuildGame.cmd
+```
+
+**Full path** (quotes required because of spaces):
+
+```powershell
+& "D:\SWD\Projects\Unreal Projects\AI_Sandbox\SimTextureStrm\BuildGame.cmd"
+```
+
+**Or** call Unreal **`Build.bat`** directly:
+
+```powershell
+& "C:\Program Files\Epic Games\UE_5.6\Engine\Build\BatchFiles\Build.bat" SimTextureStrmEditor Win64 Development -Project="D:\SWD\Projects\Unreal Projects\AI_Sandbox\SimTextureStrm\SimTextureStrm.uproject" -WaitMutex -FromMsBuild -architecture=x64
+```
+
+---
+
+# Launch editor / open project (separate script)
+
+When the user asks to **open the project**, **launch Unreal**, **launch the editor**, **run LaunchProject**, or **run LaunchGame**, use **`LaunchProject.cmd`** or **`LaunchGame.cmd`** (alias) only (still **not** combined with build unless they ask for both steps):
+
+```powershell
+.\LaunchGame.cmd
+```
+
+```powershell
+.\LaunchProject.cmd
+```
+
+```powershell
+& "D:\SWD\Projects\Unreal Projects\AI_Sandbox\SimTextureStrm\LaunchProject.cmd"
+```
+
+**Keep `BuildGame.cmd` and `LaunchProject.cmd` separate** until the user asks to merge them into one script.
+
+---
+
+PowerShell notes:
+
+- Use **`&`** before quoted commands.
+- Bare **`BuildGame.cmd`** / **`LaunchGame.cmd`** / **`LaunchProject.cmd`** **fail**—use **`.\`** when the shell's current directory is the project folder.
+- Do not use MSBuild macros like **`$(BuildBatchScript)`** in the terminal.
+
+Do **not** use this rule for generic **build** / **compile** / **run** requests that do not refer to this game workflow unless the user ties them to it.
