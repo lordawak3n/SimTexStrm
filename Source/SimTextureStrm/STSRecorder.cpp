@@ -19,7 +19,7 @@ namespace
 	constexpr float FrameBudgetMs60 = 16.67f;
 	constexpr float FrameBudgetMs30 = 33.33f;
 
-	const TCHAR* const CsvHeader = TEXT("Frame,TimeSec,FrameMs,GameThreadMs,RenderThreadMs,RHIThreadMs,GpuMs,TilesAlive,TexMB_512,TexMB_1k,TexMB_2k,TexMB_4k,ProcessPhysMB,RHITextureMB,Uploads,UploadMB,CacheHits,PendingRequests\n");
+	const TCHAR* const CsvHeader = TEXT("Frame,TimeSec,FrameMs,GameThreadMs,RenderThreadMs,RHIThreadMs,GpuMs,TilesAlive,TexMB_512,TexMB_1k,TexMB_2k,TexMB_4k,ProcessPhysMB,RHITextureMB,Uploads,UploadMB,CacheHits,PendingRequests,RequestsIssued,ResponsesReleased,ResponseMB,ResponseLatencyAvgMs,ResponseLatencyMaxMs,StaleDiscarded,ChecksumFailures,ConsumerMs,ChecksumMs,IssueMs\n");
 
 	void WriteUtf8(FArchive& Writer, const FString& Text)
 	{
@@ -168,9 +168,11 @@ void FSTSRecorder::FlushPending()
 		Text.Reserve(Chunk.Num() * 128);
 		for (const FSTSFrameSample& Row : Chunk)
 		{
-			Text.Appendf(TEXT("%llu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,0,0,0,0\n"),
+			Text.Appendf(TEXT("%llu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,0,0,0,%d,%d,%d,%.3f,%.3f,%.3f,%d,%d,%.4f,%.4f,%.4f\n"),
 				Row.Frame, Row.TimeSec, Row.FrameMs, Row.GameThreadMs, Row.RenderThreadMs, Row.RHIThreadMs, Row.GpuMs,
-				Row.TilesAlive, Row.TexMB[0], Row.TexMB[1], Row.TexMB[2], Row.TexMB[3], Row.ProcessPhysMB, Row.RHITextureMB);
+				Row.TilesAlive, Row.TexMB[0], Row.TexMB[1], Row.TexMB[2], Row.TexMB[3], Row.ProcessPhysMB, Row.RHITextureMB,
+				Row.PendingRequests, Row.RequestsIssued, Row.ResponsesReleased, Row.ResponseMB, Row.ResponseLatencyAvgMs, Row.ResponseLatencyMaxMs,
+				Row.StaleDiscarded, Row.ChecksumFailures, Row.ConsumerMs, Row.ChecksumMs, Row.IssueMs);
 		}
 		WriteUtf8(*Writer, Text);
 	});

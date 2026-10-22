@@ -47,7 +47,8 @@ public:
 
 	/**
 	 * Authors every mip independently (no downsampling) and encodes it as DXT1 in 4-colour mode.
-	 * Variant is reserved for the per-update stripe in a later phase and has no effect yet.
+	 * Variant 0 is the plain Phase 0 look. Variant k > 0 adds k bars of the inverted base colour along u - v = const,
+	 * crossing both triangle orientations and kept at least one texel wide down to the 1x1 mip.
 	 */
-	static void GenerateChain(int32 Width, int32 Height, const FSTSTextureLook& Look, uint32 /*Variant*/, FSTSMipChain& OutChain);
+	static void GenerateChain(int32 Width, int32 Height, const FSTSTextureLook& Look, uint32 Variant, FSTSMipChain& OutChain);
 };

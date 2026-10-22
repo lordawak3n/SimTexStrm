@@ -5,6 +5,8 @@ param(
     [int]$ResY = 2160,
     [switch]$Trace,
     [switch]$Sequence,
+    [ValidateSet('SteadySpread', 'SpreadSweep', 'Burst', 'Oscillation', 'Soak', 'Overhead', 'Lifetime')]
+    [string]$Scenario,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$PassThrough
 )
@@ -52,7 +54,9 @@ if ($Trace) {
     $arguments.Add("-tracefile=`"$traceFile`"")
 }
 
+if ($Sequence -and $Scenario) { Write-Error 'Use either -Sequence or -Scenario, not both.'; exit 1 }
 if ($Sequence) { $arguments.Add('-STSSequence') }
+if ($Scenario) { $arguments.Add("-STSScenario=$Scenario") }
 
 foreach ($extra in $PassThrough) {
     if ($extra -match '\s') { $arguments.Add("`"$extra`"") } else { $arguments.Add($extra) }
@@ -66,13 +70,13 @@ $startInfo.Arguments = $argumentString
 $startInfo.WorkingDirectory = $projectDir
 $startInfo.UseShellExecute = $false
 
-Write-Host "Launching benchmark ($Mode, ${ResX}x${ResY}$(if ($Trace) { ', trace' })$(if ($Sequence) { ', sequence' }))"
+Write-Host "Launching benchmark ($Mode, ${ResX}x${ResY}$(if ($Trace) { ', trace' })$(if ($Sequence) { ', sequence' })$(if ($Scenario) { ", scenario $Scenario" }))"
 Write-Host "  $editor $argumentString"
 
 $process = [System.Diagnostics.Process]::Start($startInfo)
 if (-not $process) { Write-Error 'Failed to start the process.'; exit 1 }
 
-if ($Sequence) {
+if ($Sequence -or $Scenario) {
     $process.WaitForExit()
     exit $process.ExitCode
 }

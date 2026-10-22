@@ -104,4 +104,120 @@ namespace
 			}
 			Testbench->SetHudVisible(Args.IsValidIndex(0) ? FCString::Atoi(*Args[0]) != 0 : !Testbench->IsHudVisible());
 		}));
+
+	FAutoConsoleCommandWithWorldAndArgs BurstCommand(
+		TEXT("sts.Burst"),
+		TEXT("sts.Burst [n4k n2k n1k n512]: issues a burst of update requests in one frame. Counts are by requested resolution; without arguments the Burst* knobs are used."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			ASTSTestbench* Testbench = FindTestbench(World, TEXT("sts.Burst"));
+			if (!Testbench)
+			{
+				return;
+			}
+			if (Args.Num() == 0)
+			{
+				Testbench->TriggerBurst();
+				return;
+			}
+			const auto Count = [&Args](int32 Index) { return Args.IsValidIndex(Index) ? FCString::Atoi(*Args[Index]) : 0; };
+			Testbench->TriggerBurstCounts(Count(0), Count(1), Count(2), Count(3));
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs SpreadCommand(
+		TEXT("sts.Spread"),
+		TEXT("sts.Spread [Rate] [DurationSec]: spreads update requests over time. Defaults come from the testbench; a duration of 0 runs until sts.Spread.Stop."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			ASTSTestbench* Testbench = FindTestbench(World, TEXT("sts.Spread"));
+			if (!Testbench)
+			{
+				return;
+			}
+			const double Rate = Args.IsValidIndex(0) ? FCString::Atod(*Args[0]) : double(Testbench->SpreadRatePerSec);
+			const double DurationSec = Args.IsValidIndex(1) ? FCString::Atod(*Args[1]) : double(Testbench->SpreadDurationSec);
+			Testbench->StartSpreadRate(Rate, DurationSec);
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs SpreadStopCommand(
+		TEXT("sts.Spread.Stop"),
+		TEXT("Stops the spread (and any repeating burst)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+		{
+			if (ASTSTestbench* Testbench = FindTestbench(World, TEXT("sts.Spread.Stop")))
+			{
+				Testbench->StopSpread();
+			}
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs ScenarioRunCommand(
+		TEXT("sts.Scenario.Run"),
+		TEXT("Runs the testbench's ScenarioSteps."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+		{
+			if (ASTSTestbench* Testbench = FindTestbench(World, TEXT("sts.Scenario.Run")))
+			{
+				Testbench->RunScenario();
+			}
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs ScenarioStopCommand(
+		TEXT("sts.Scenario.Stop"),
+		TEXT("Stops the running scenario without quitting."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+		{
+			if (ASTSTestbench* Testbench = FindTestbench(World, TEXT("sts.Scenario.Stop")))
+			{
+				Testbench->StopScenario();
+			}
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs ScenarioApplyCommand(
+		TEXT("sts.Scenario.Apply"),
+		TEXT("sts.Scenario.Apply <Preset>: fills ScenarioSteps from a preset (SteadySpread, SpreadSweep, Burst, Oscillation, Soak, Overhead, Lifetime)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			ASTSTestbench* Testbench = FindTestbench(World, TEXT("sts.Scenario.Apply"));
+			if (!Testbench)
+			{
+				return;
+			}
+			if (Args.Num() == 0)
+			{
+				UE_LOG(LogSTS, Error, TEXT("sts.Scenario.Apply needs a preset name."));
+				return;
+			}
+			Testbench->SetScenarioPresetByName(Args[0]);
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs PatternCommand(
+		TEXT("sts.Pattern"),
+		TEXT("sts.Pattern <SameResolution|StepUp|StepDown|Mixed|Oscillate>: sets the update pattern."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			ASTSTestbench* Testbench = FindTestbench(World, TEXT("sts.Pattern"));
+			if (!Testbench)
+			{
+				return;
+			}
+			if (Args.Num() == 0)
+			{
+				UE_LOG(LogSTS, Error, TEXT("sts.Pattern needs a pattern name."));
+				return;
+			}
+			Testbench->SetPatternByName(Args[0]);
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs ChecksumsCommand(
+		TEXT("sts.Checksums"),
+		TEXT("sts.Checksums [0|1]: enables or disables response checksum verification; without an argument it toggles."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			ASTSTestbench* Testbench = FindTestbench(World, TEXT("sts.Checksums"));
+			if (!Testbench)
+			{
+				return;
+			}
+			Testbench->SetChecksumsEnabled(Args.IsValidIndex(0) ? FCString::Atoi(*Args[0]) != 0 : !Testbench->AreChecksumsEnabled());
+		}));
 }

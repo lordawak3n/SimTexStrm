@@ -53,12 +53,15 @@ namespace
 		bool bDrawLines = false;
 		bool bDrawDiagonal = false;
 		int32 CheckerCell = 0;
+		int32 StripeCount = 0;
+		float StripeHalfWidth = 0.0f;
 		FRgb Base;
 		FRgb BaseDark;
 		FRgb Border;
+		FRgb Stripe;
 	};
 
-	FMipContext MakeMipContext(const FSTSTextureLook& Look, int32 MipIndex, int32 Width, int32 Height)
+	FMipContext MakeMipContext(const FSTSTextureLook& Look, int32 MipIndex, int32 Width, int32 Height, uint32 Variant)
 	{
 		FMipContext Context;
 		Context.Width = Width;
@@ -85,6 +88,16 @@ namespace
 			Context.CheckerCell = FMath::Max(1, Width / CellsAcross);
 			Context.BaseDark = ToRgb(Look.BaseColor, Look.MipBrightnessLow);
 		}
+
+		if (Variant > 0)
+		{
+			Context.StripeCount = int32(Variant);
+			Context.Stripe = { 255 - Look.BaseColor.R, 255 - Look.BaseColor.G, 255 - Look.BaseColor.B };
+
+			// Bars sit at d = u - v = (i / (k + 1)) - 0.5 for i = 1..k. Width is half the spacing, but never under one texel (1 / Width in d).
+			const float Spacing = 1.0f / (Context.StripeCount + 1);
+			Context.StripeHalfWidth = FMath::Min(FMath::Max(Spacing * 0.5f, 1.0f / Width), Spacing * 0.9f) * 0.5f;
+		}
 		return Context;
 	}
 
@@ -107,6 +120,17 @@ namespace
 				{
 					return Context.Border;
 				}
+			}
+		}
+
+		if (Context.StripeCount > 0)
+		{
+			const float Difference = (X + 0.5f) / Context.Width - (Y + 0.5f) / Context.Height;
+			const float Scaled = (Difference + 0.5f) * (Context.StripeCount + 1);
+			const float Nearest = FMath::Clamp(FMath::RoundToFloat(Scaled), 1.0f, float(Context.StripeCount));
+			if (FMath::Abs(Scaled - Nearest) / (Context.StripeCount + 1) <= Context.StripeHalfWidth)
+			{
+				return Context.Stripe;
 			}
 		}
 
@@ -219,13 +243,13 @@ namespace
 		OutBlock[7] = uint8((Indices >> 24) & 0xFF);
 	}
 
-	void GenerateMip(const FSTSTextureLook& Look, int32 MipIndex, int32 Width, int32 Height, TArray<uint8>& OutBytes)
+	void GenerateMip(const FSTSTextureLook& Look, int32 MipIndex, int32 Width, int32 Height, uint32 Variant, TArray<uint8>& OutBytes)
 	{
 		const int32 BlocksX = FMath::Max(1, Width / 4);
 		const int32 BlocksY = FMath::Max(1, Height / 4);
 		OutBytes.SetNumUninitialized(BlocksX * BlocksY * 8);
 
-		const FMipContext Context = MakeMipContext(Look, MipIndex, Width, Height);
+		const FMipContext Context = MakeMipContext(Look, MipIndex, Width, Height, Variant);
 		uint8* Output = OutBytes.GetData();
 
 		ParallelFor(BlocksY, [&Context, Output, BlocksX, Width, Height](int32 BlockY)
@@ -270,7 +294,7 @@ int64 FSTSDxt1Generator::GetChainBytes(int32 Width, int32 Height)
 	return Total;
 }
 
-void FSTSDxt1Generator::GenerateChain(int32 Width, int32 Height, const FSTSTextureLook& Look, uint32 /*Variant*/, FSTSMipChain& OutChain)
+void FSTSDxt1Generator::GenerateChain(int32 Width, int32 Height, const FSTSTextureLook& Look, uint32 Variant, FSTSMipChain& OutChain)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(STS_GenerateChain);
 
@@ -283,7 +307,7 @@ void FSTSDxt1Generator::GenerateChain(int32 Width, int32 Height, const FSTSTextu
 
 	for (int32 MipIndex = 0; MipIndex < MipCount; ++MipIndex)
 	{
-		GenerateMip(Look, MipIndex, FMath::Max(1, Width >> MipIndex), FMath::Max(1, Height >> MipIndex), OutChain.Mips[MipIndex]);
+		GenerateMip(Look, MipIndex, FMath::Max(1, Width >> MipIndex), FMath::Max(1, Height >> MipIndex), Variant, OutChain.Mips[MipIndex]);
 		OutChain.TotalBytes += OutChain.Mips[MipIndex].Num();
 	}
 }

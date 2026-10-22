@@ -4,8 +4,10 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "Math/RandomStream.h"
 #include "STSDxt1Generator.h"
 #include "STSRecorder.h"
+#include "STSTerrainServer.h"
 #include "STSTypes.h"
 #include "STSTestbench.generated.h"
 
@@ -34,7 +36,19 @@ struct FSTSTile
 	UPROPERTY(Transient)
 	TObjectPtr<UTexture2D> Texture;
 
+	/** The visual (Phase 0) resolution of the texture that is actually on the tile. */
 	int32 Resolution = 0;
+
+	int32 CellX = 0;
+	int32 CellY = 0;
+
+	/** Distance rank from the grid centre; the ranking that assigns the resolution rings. */
+	int32 Rank = 0;
+
+	// Logical state: what the tile would be after the responses released so far. Visuals do not follow it in Phase 1.
+	int32 LogicalResolution = 0;
+	int32 LogicalVariant = 0;
+	int64 PendingRequestId = INDEX_NONE;
 };
 
 /** Where a tile will be created; resolved up front so time-sliced creation is deterministic. */
@@ -44,6 +58,7 @@ struct FSTSTilePlan
 	int32 CellY = 0;
 	bool bUpper = false;
 	int32 Resolution = 512;
+	int32 Rank = 0;
 	FVector CellOrigin = FVector::ZeroVector;
 };
 
@@ -62,6 +77,8 @@ enum class ESTSSequenceStep : uint8
 /**
  * Phase 0 static harness: a grid of procedural triangle tiles with procedural DXT1 textures,
  * a benchmark recorder, a HUD and console commands (see STSConsoleCommands.cpp).
+ * Phase 1 adds the synthetic terrain server, update triggers and the scenario runner
+ * (STSTestbenchUpdates.cpp, STSTestbenchScenario.cpp). Responses are validated and accounted for; no texture is updated.
  */
 UCLASS(Blueprintable)
 class SIMTEXTURESTRM_API ASTSTestbench : public AActor
@@ -103,9 +120,36 @@ public:
 	UFUNCTION(CallInEditor, BlueprintCallable, Category = "STS|Sequence")
 	void RunPhase0Sequence();
 
+	/** Issues the Burst4k/2k/1k/512 knob counts in one frame. */
+	UFUNCTION(CallInEditor, BlueprintCallable, Category = "STS|Updates|Burst")
+	void TriggerBurst();
+
+	UFUNCTION(CallInEditor, BlueprintCallable, Category = "STS|Updates|Spread")
+	void StartSpread();
+
+	UFUNCTION(CallInEditor, BlueprintCallable, Category = "STS|Updates|Spread")
+	void StopSpread();
+
+	UFUNCTION(CallInEditor, BlueprintCallable, Category = "STS|Scenario")
+	void RunScenario();
+
+	UFUNCTION(CallInEditor, BlueprintCallable, Category = "STS|Scenario")
+	void StopScenario();
+
+	/** Replaces ScenarioSteps with the steps of ScenarioPreset (Custom leaves them untouched). */
+	UFUNCTION(CallInEditor, BlueprintCallable, Category = "STS|Scenario")
+	void ApplyScenarioPreset();
+
 	void StartRecordingNamed(const FString& Name, double DurationSec);
 	void SetHudVisible(bool bVisible) { bShowHud = bVisible; }
 	bool IsHudVisible() const { return bShowHud; }
+
+	void TriggerBurstCounts(int32 Requested4k, int32 Requested2k, int32 Requested1k, int32 Requested512);
+	void StartSpreadRate(double RatePerSec, double DurationSec);
+	void SetPatternByName(const FString& Name);
+	void SetScenarioPresetByName(const FString& Name);
+	void SetChecksumsEnabled(bool bEnabled) { bVerifyChecksums = bEnabled; }
+	bool AreChecksumsEnabled() const { return bVerifyChecksums; }
 
 	// --- STS|Tiles ---
 
@@ -197,6 +241,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Texture Look")
 	bool bSRGB = true;
 
+	/** Phase 0 creation path only: the variant stripe drawn on every tile texture the next time textures are created (RegenerateTextures or CreateTiles). 0 is the plain look. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Texture Look", meta = (ClampMin = "0", ClampMax = "15"))
+	int32 DebugPreviewVariant = 0;
+
 	// --- STS|Camera ---
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "STS|Camera")
@@ -264,6 +312,153 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|HUD")
 	bool bShowHud = true;
 
+	// --- STS|Updates|Server ---
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Server", meta = (ClampMin = "1", ClampMax = "32"))
+	int32 ServerWorkerCount = 4;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Server", meta = (ClampMin = "0.0"))
+	float ServerLatencyMs = 20.0f;
+
+	/** Uniform +/- jitter, seeded per request ID. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Server", meta = (ClampMin = "0.0"))
+	float ServerLatencyJitterMs = 5.0f;
+
+	/** Link bandwidth in MB (1048576 bytes) per second. 0 is unlimited; 1100 is about 10GbE. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Server", meta = (ClampMin = "0.0"))
+	float ServerLinkBandwidthMBps = 0.0f;
+
+	/** Requests admitted at once; the rest wait in a backlog. 0 is unlimited. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Server", meta = (ClampMin = "0"))
+	int32 ServerMaxInFlight = 0;
+
+	/** Content variants per resolution in the payload library. Variant 0 is the plain look. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Server", meta = (ClampMin = "1", ClampMax = "16"))
+	int32 VariantsPerResolution = 4;
+
+	/** Recomputes each response's checksum on the game thread. Turn off for benchmark runs; the cost is reported separately. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Server")
+	bool bVerifyChecksums = true;
+
+	/** Debug: workers corrupt every Nth response (by request ID) so the checksum failure path can be seen. 0 is off. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Server", meta = (ClampMin = "0"))
+	int32 DebugCorruptEveryN = 0;
+
+	/** Builds the payload library at BeginPlay. Otherwise it is built on first use (and always before a scenario starts). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Server")
+	bool bPregeneratePayloadsOnBeginPlay = false;
+
+	// --- STS|Updates ---
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates")
+	int32 UpdateSeed = 12345;
+
+	/** Reseeds before every trigger, so each trigger repeats exactly. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates")
+	bool bResetSeedPerTrigger = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates")
+	ESTSUpdatePattern UpdatePattern = ESTSUpdatePattern::Mixed;
+
+	/** Mixed pattern weights. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates", meta = (ClampMin = "0.0"))
+	float MixedWeightSame = 1.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates", meta = (ClampMin = "0.0"))
+	float MixedWeightUp = 1.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates", meta = (ClampMin = "0.0"))
+	float MixedWeightDown = 1.0f;
+
+	/** SameResolution wraps past the last variant to 1 instead of 0 (needs 3 or more variants). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates")
+	bool bSkipVariantZero = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates")
+	ESTSImpossibleStepPolicy ImpossibleStepPolicy = ESTSImpossibleStepPolicy::PickAnotherTile;
+
+	/** Allows a tile with a request in flight to be targeted again; its older response is then superseded. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates")
+	bool bAllowRetargetInFlight = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates")
+	ESTSTargetMode TargetMode = ESTSTargetMode::Random;
+
+	/** RankRange: inclusive distance rank from the grid centre (rank 0 is the nearest tile). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates", meta = (ClampMin = "0"))
+	int32 RankMin = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates", meta = (ClampMin = "0"))
+	int32 RankMax = 999;
+
+	/** Patch: a rectangle of cells (both triangles of each cell). It wraps around the grid edges. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates")
+	int32 PatchCenterX = 12;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates")
+	int32 PatchCenterY = 10;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates", meta = (ClampMin = "1"))
+	int32 PatchSizeX = 6;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates", meta = (ClampMin = "1"))
+	int32 PatchSizeY = 6;
+
+	/** Cells the patch moves per trigger, to simulate travel. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates")
+	int32 PatchStepX = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates")
+	int32 PatchStepY = 0;
+
+	// --- STS|Updates|Burst ---
+
+	/** Counts by requested (target) resolution. With Oscillate they address the pair by its larger resolution. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Burst", meta = (ClampMin = "0"))
+	int32 Burst4k = 20;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Burst", meta = (ClampMin = "0"))
+	int32 Burst2k = 40;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Burst", meta = (ClampMin = "0"))
+	int32 Burst1k = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Burst", meta = (ClampMin = "0"))
+	int32 Burst512 = 0;
+
+	// --- STS|Updates|Spread ---
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Spread", meta = (ClampMin = "0.0"))
+	float SpreadRatePerSec = 5.0f;
+
+	/** 0 spreads until StopSpread. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Spread", meta = (ClampMin = "0.0"))
+	float SpreadDurationSec = 0.0f;
+
+	/** The target resolution mix (SpreadResolutionWeights). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Spread", meta = (ClampMin = "0.0"))
+	float SpreadWeight512 = 1.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Spread", meta = (ClampMin = "0.0"))
+	float SpreadWeight1k = 1.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Spread", meta = (ClampMin = "0.0"))
+	float SpreadWeight2k = 1.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Spread", meta = (ClampMin = "0.0"))
+	float SpreadWeight4k = 1.0f;
+
+	// --- STS|Scenario ---
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Scenario")
+	bool bRunScenarioOnBeginPlay = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Scenario")
+	ESTSScenarioPreset ScenarioPreset = ESTSScenarioPreset::SteadySpread;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Scenario")
+	TArray<FSTSScenarioStep> ScenarioSteps;
+
 private:
 	struct FHudStats
 	{
@@ -291,6 +486,105 @@ private:
 		float ShownMaxRenderMs = 0.0f;
 		float ShownMaxRHIMs = 0.0f;
 		float ShownMaxGpuMs = 0.0f;
+
+		// Update stream, accumulated over the same window.
+		int32 Issued = 0;
+		int32 Released = 0;
+		double ReleasedMB = 0.0;
+		double LatencySumMs = 0.0;
+		float LatencyMaxMs = 0.0f;
+		double ConsumerSumMs = 0.0;
+		float ConsumerMaxMs = 0.0f;
+
+		float IssuedPerSec = 0.0f;
+		float ReleasedPerSec = 0.0f;
+		float MBPerSec = 0.0f;
+		float LatencyAvgMs = 0.0f;
+		float ShownLatencyMaxMs = 0.0f;
+		float ConsumerAvgMs = 0.0f;
+		float ShownConsumerMaxMs = 0.0f;
+	};
+
+	/** What the update stream did during one frame; becomes one CSV row's Phase 1 columns. */
+	struct FUpdateFrameCounters
+	{
+		int32 Issued = 0;
+		int32 Released = 0;
+		int32 Stale = 0;
+		int32 ChecksumFailures = 0;
+		double ReleasedBytes = 0.0;
+		double LatencySumMs = 0.0;
+		double LatencyMaxMs = 0.0;
+		double ConsumerMs = 0.0;
+		double ChecksumMs = 0.0;
+		double IssueMs = 0.0;
+	};
+
+	/** The outcome of one trigger (a burst, or the requests due in one spread frame). */
+	struct FBatchResult
+	{
+		int32 Requested = 0;
+		int32 Issued = 0;
+		int32 Shortfall = 0;
+		int32 Skipped = 0;
+		int32 RequestedByBucket[STS::NumBuckets] = {};
+		int32 IssuedByBucket[STS::NumBuckets] = {};
+		uint64 SelectionHash = 0;
+		double TimeSec = 0.0;
+	};
+
+	/** Totals over the active recording, for the summary. Reset when a recording starts. */
+	struct FUpdateWindow
+	{
+		int64 Issued = 0;
+		int64 Released = 0;
+		int64 Stale = 0;
+		int64 Late = 0;
+		int64 Superseded = 0;
+		int64 ChecksumFailures = 0;
+		int64 ChecksumBytes = 0;
+		double ReleasedBytes = 0.0;
+		double ChecksumMsTotal = 0.0;
+		double ChecksumMsWorst = 0.0;
+		int32 BurstCount = 0;
+		int64 BurstRequested = 0;
+		int64 BurstIssued = 0;
+		int64 SpreadRequested = 0;
+		int64 SpreadIssued = 0;
+		uint64 SelectionHashChain = 0;
+		TArray<float> LatencyMs;
+		TArray<float> ReleaseLagMs;
+		TArray<float> ModelLatencyMs;
+		TArray<float> ConsumerMs;
+		TArray<float> ChecksumMs;
+		TArray<float> IssueMs;
+		TArray<FString> BurstLines;
+	};
+
+	/** A timeline-driven trigger: item k is due at StartSec + k / Rate. */
+	struct FTimeline
+	{
+		bool bActive = false;
+		double StartSec = 0.0;
+		double Rate = 0.0;
+		double DurationSec = 0.0;
+		int64 NextIndex = 0;
+		int32 BurstCounts[STS::NumBuckets] = {};
+	};
+
+	struct FSelectionContext
+	{
+		TArray<uint8> Selected;
+		TArray<int32> SelectedList;
+		int32 PatchMinX = 0;
+		int32 PatchMinY = 0;
+	};
+
+	enum class EPickResult : uint8
+	{
+		Picked,
+		Shortfall,
+		Skipped
 	};
 
 	bool IsGameWorldValid(const TCHAR* Caller) const;
@@ -324,6 +618,42 @@ private:
 
 	// HUD
 	void DrawHud(UCanvas* Canvas, APlayerController* Controller);
+
+	// Server and payload library (STSTestbenchUpdates.cpp)
+	bool EnsureServer();
+	bool EnsureServerLibrary();
+	void ShutdownServer();
+	void ApplyServerSettings();
+	bool IsServerIdle() const;
+
+	// Triggers and target selection (STSTestbenchUpdates.cpp)
+	void UpdateTimelines(double NowSec);
+	/** Counts has STS::NumBuckets entries, indexed by target resolution bucket. */
+	void IssueBurst(const int32* Counts, double NowSec, const TCHAR* Source);
+
+	/** Targets pair a requested resolution with the time the request is issued (its timeline due time for a spread). */
+	void IssueBatch(const TArray<TPair<int32, double>>& Targets, bool bBurst, const TCHAR* Source);
+	EPickResult PickTile(int32 TargetResolution, FSelectionContext& Context, int32& OutTile, int32& OutResolution, int32& OutVariant);
+	void CollectPool(ESTSUpdatePattern Pattern, int32 TargetResolution, const FSelectionContext& Context, TArray<int32>& OutPool) const;
+	bool IsTileSelectable(int32 TileIndex, const FSelectionContext& Context) const;
+	int32 NextSameResolutionVariant(int32 Variant) const;
+	int32 PickSpreadResolution();
+	void ResetTriggerState();
+	void ResetLogicalState();
+
+	// Consumer (STSTestbenchUpdates.cpp)
+	void ConsumeResponses(double NowSec);
+	void ProcessResponse(const FSTSResponse& Response, double NowSec);
+	void FillUpdateColumns(FSTSFrameSample& Sample);
+	void GatherUpdateSummary(TArray<FString>& OutLines) const;
+	void AppendUpdateHud(TArray<TPair<FString, FLinearColor>>& Lines, double NowSec) const;
+
+	// Scenario (STSTestbenchScenario.cpp)
+	void BuildScenarioPreset(ESTSScenarioPreset Preset, TArray<FSTSScenarioStep>& OutSteps) const;
+	void UpdateScenario(double NowSec);
+	bool ExecuteScenarioStep(const FSTSScenarioStep& Step, bool bFirstFrame, double NowSec);
+	void FinishScenario(const TCHAR* Reason);
+	void RequestQuit(const TCHAR* Reason);
 
 	UPROPERTY(VisibleAnywhere, Category = "STS")
 	TObjectPtr<USceneComponent> SceneRoot;
@@ -377,4 +707,46 @@ private:
 	ESTSSequenceStep SequenceStep = ESTSSequenceStep::Idle;
 	double SequenceStepStartSec = 0.0;
 	bool bSequenceQuitWhenDone = false;
+
+	// --- Phase 1: server, update stream, scenario ---
+
+	TUniquePtr<FSTSTerrainServer> Server;
+	TSharedPtr<const FSTSPayloadLibrary> ServerLibrary;
+	TArray<FSTSTextureLook> ServerLibraryLooks;
+	int32 ServerLibraryVariants = 0;
+	int32 PayloadLibraryVariant = 0;
+
+	/** Bumped whenever tiles are destroyed; responses of an older epoch are discarded. */
+	uint32 TileEpoch = 0;
+	int64 NextRequestId = 0;
+	int32 ActiveCellsX = 1;
+	int32 ActiveCellsY = 1;
+	int32 LogicalCountsPerBucket[STS::NumBuckets] = {};
+
+	FRandomStream UpdateStream;
+	int32 PatchTriggerCount = 0;
+	FTimeline Spread;
+	FTimeline BurstRepeat;
+	TArray<int32> PoolScratch[3];
+	TArray<FSTSResponse> ReleasedScratch;
+
+	FUpdateFrameCounters Frame;
+	FUpdateWindow Window;
+	FBatchResult LastBurst;
+	bool bHasLastBurst = false;
+	FSTSServerCounters LastServerCounters;
+	int64 TotalChecksumFailures = 0;
+	int64 TotalRequestsIssued = 0;
+	int64 TotalStaleDiscarded = 0;
+	int32 LoggedChecksumFailures = 0;
+	double TotalChecksumMs = 0.0;
+	double TotalChecksumBytes = 0.0;
+	double LastChecksumMsPerMB = 0.0;
+
+	TArray<FSTSScenarioStep> ScenarioRuntimeSteps;
+	bool bScenarioRunning = false;
+	bool bScenarioStepEntered = false;
+	bool bScenarioQuitWhenDone = false;
+	int32 ScenarioStepIndex = 0;
+	double ScenarioStepStartSec = 0.0;
 };

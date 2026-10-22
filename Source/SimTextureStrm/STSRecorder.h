@@ -9,6 +9,7 @@
 /** One CSV row. Columns reserved for later phases are written as 0 and are not stored. */
 struct FSTSFrameSample
 {
+	// Phase 0 columns.
 	uint64 Frame = 0;
 	double TimeSec = 0.0;
 	float FrameMs = 0.0f;
@@ -20,6 +21,19 @@ struct FSTSFrameSample
 	float TexMB[STS::NumBuckets] = {};
 	float ProcessPhysMB = 0.0f;
 	float RHITextureMB = 0.0f;
+
+	// Phase 1 columns. Counts and times are per frame; PendingRequests is the value at the end of the frame.
+	int32 PendingRequests = 0;
+	int32 RequestsIssued = 0;
+	int32 ResponsesReleased = 0;
+	float ResponseMB = 0.0f;
+	float ResponseLatencyAvgMs = 0.0f;
+	float ResponseLatencyMaxMs = 0.0f;
+	int32 StaleDiscarded = 0;
+	int32 ChecksumFailures = 0;
+	float ConsumerMs = 0.0f;
+	float ChecksumMs = 0.0f;
+	float IssueMs = 0.0f;
 };
 
 struct FSTSColumnStats

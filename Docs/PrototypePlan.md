@@ -54,7 +54,7 @@ Pools (from Phase 3) default to 1.5× the working set per bucket, about 2.8 GB o
 
 ## Phases
 
-### Phase 0 – Static harness
+### Phase 0 – Static harness (status: done, signed off)
 Specification: [`Phase0_Harness.md`](Phase0_Harness.md).
 
 A static scene of 1000 procedural triangle tiles (configurable), with a procedural DXT1 texture per tile (colour-coded by resolution, borders, mip coding). Tile creation and destruction can be toggled. All knobs are on a placeable actor. It also includes a benchmark recorder (CSV plus percentile summary), an on-screen HUD, and `RunBenchmark.cmd`.
@@ -62,6 +62,8 @@ A static scene of 1000 procedural triangle tiles (configurable), with a procedur
 **Milestone 0:** correct visuals, and noise-floor recordings **before and after** tile creation.
 
 ### Phase 1 – Synthetic terrain server and update knobs
+Specification: [`Phase1_TerrainServer.md`](Phase1_TerrainServer.md).
+
 - Worker-thread "server" that answers (tile ID, resolution) requests with DXT1 payloads plus full mip chains, after a configurable delay. Payloads are served from a pre-generated library (memcpy), so generation cost doesn't pollute measurements.
 - Knobs:
   - **Burst:** a count per resolution, all in one frame.
@@ -89,23 +91,29 @@ A static scene of 1000 procedural triangle tiles (configurable), with a procedur
 - A check that fires on any `UpdateResource` call on a pooled slot.
 - The reuse policy **stays FIFO**, so this phase isolates the upload path change.
 - Selected with `-StsMode=Regions`.
+- Uploads go through an uploader interface, so Phase 4 can plug in an alternative without touching pool logic.
+- The Insights trace must separate **byte cost** (memcpy) from **fixed cost per call** (per `UpdateTextureRegions` / `RHIUpdateTexture2D` call). It must also show whether the RHI makes an **extra intermediate CPU copy** of the source data before writing it to upload memory.
 
-**Milestone 3:** tail mips (2×2, 1×1) verified, and a direct comparison against Phase 2.
+**Milestone 3:** tail mips (2×2, 1×1) verified, a direct comparison against Phase 2, and the per-call vs. per-byte cost breakdown (which sets expectations for Phase 4).
 
-### Phase 4 – Event-driven completion, upload budget, GPU cache
+### Phase 4 – Custom `ENQUEUE_RENDER_COMMAND` uploader (moved ahead of budget/cache)
+- **One render command per frame** that processes every pending texture update. Within it, mips are still uploaded one at a time: D3D12 copies one sub-resource per copy, and upload memory needs rows on 256-byte and mips on 512-byte boundaries, so small DXT1 mips must be re-packed row by row.
+- Two variants behind the Phase 3 uploader interface:
+  - `-StsMode=CustomUpdate`: `RHIUpdateTexture2D` per mip, from inside the single command.
+  - `-StsMode=CustomLock`: lock each mip, write directly into upload memory (respecting the pitch), then unlock. This is the test of whether skipping the possible intermediate copy matters.
+- One completion signal per texture.
+- Same FIFO reuse and no budget, so the comparison against Phase 3 isolates the uploader.
+
+**Milestone 4:** Regions vs. CustomUpdate vs. CustomLock under steady and burst scenarios, and a decision on which uploader to carry forward and port.
+
+### Phase 5 – Event-driven completion, upload budget, GPU cache
+- Built on the uploader chosen in Phase 4. The others stay selectable for comparison.
 - Cleanup-callback / fence completion replaces frame-count waits, for visibility and for releasing the old slot.
-- A per-frame upload budget (`sts.UploadBudgetMB`), filled by priority (nearest-first or a synthetic priority).
+- A per-frame upload budget (`sts.UploadBudgetMB`), filled by priority (nearest-first or a synthetic priority). If the chosen uploader is a custom one, the budget is applied on the render thread.
 - An LRU free list per pool, plus a map from (tile, resolution) to slot, gives GPU cache hits with no upload. The CPU cache stays as a second level.
 - The recorder adds cache hit rate, queue depth, and budget-induced latency.
 
-**Milestone 4:** worst-case frame times under burst tests, compared with Phase 3.
-
-### Phase 5 – Custom `ENQUEUE_RENDER_COMMAND` uploader
-- All mips of a texture in one render command, calling `RHIUpdateTexture2D` directly.
-- Budgeting on the render thread, with one completion signal per texture.
-- Selected with `-StsMode=Custom`. Compared against Regions mode.
-
-**Milestone 5:** a decision on which uploader to port.
+**Milestone 5:** worst-case frame times under burst tests, compared with Phase 4.
 
 ### Phase 6 – GPU profiling of the upload copies
 - PIX plus Unreal Insights GPU captures of a burst frame.

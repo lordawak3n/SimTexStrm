@@ -179,6 +179,46 @@ void ASTSTestbench::BeginPlay()
 		bSequenceQuitWhenDone = true;
 	}
 
+	bool bRunScenario = bRunScenarioOnBeginPlay;
+	bScenarioQuitWhenDone = false;
+	FString ScenarioName;
+	if (FParse::Value(FCommandLine::Get(), TEXT("STSScenario="), ScenarioName) && !ScenarioName.IsEmpty())
+	{
+		const int64 PresetValue = StaticEnum<ESTSScenarioPreset>()->GetValueByNameString(ScenarioName);
+		if (PresetValue == INDEX_NONE || PresetValue == int64(ESTSScenarioPreset::Custom))
+		{
+			UE_LOG(LogSTS, Error, TEXT("-STSScenario=%s is not a scenario preset; ignored."), *ScenarioName);
+		}
+		else
+		{
+			ScenarioPreset = ESTSScenarioPreset(PresetValue);
+			ApplyScenarioPreset();
+			bRunScenario = true;
+			bScenarioQuitWhenDone = true;
+			if (bRunSequence)
+			{
+				UE_LOG(LogSTS, Warning, TEXT("Both -STSScenario and -STSSequence were given; running the scenario only."));
+				bRunSequence = false;
+			}
+		}
+	}
+
+	// Command-line overrides, so unattended -game runs can change server knobs without editing the Blueprint.
+	int32 ChecksumOverride = 0;
+	if (FParse::Value(FCommandLine::Get(), TEXT("STSChecksums="), ChecksumOverride))
+	{
+		bVerifyChecksums = ChecksumOverride != 0;
+	}
+	FParse::Value(FCommandLine::Get(), TEXT("STSWorkers="), ServerWorkerCount);
+	FParse::Value(FCommandLine::Get(), TEXT("STSLatencyMs="), ServerLatencyMs);
+	FParse::Value(FCommandLine::Get(), TEXT("STSJitterMs="), ServerLatencyJitterMs);
+	FParse::Value(FCommandLine::Get(), TEXT("STSBandwidthMBps="), ServerLinkBandwidthMBps);
+	FParse::Value(FCommandLine::Get(), TEXT("STSMaxInFlight="), ServerMaxInFlight);
+	FParse::Value(FCommandLine::Get(), TEXT("STSCorruptEveryN="), DebugCorruptEveryN);
+
+	UpdateStream.Initialize(UpdateSeed);
+	ResetTriggerState();
+
 	LogRenderSettings();
 	ResolveBaseMaterial();
 	ApplyCameraPreset();
@@ -196,7 +236,17 @@ void ASTSTestbench::BeginPlay()
 		CreateTiles();
 	}
 
-	if (bRunSequence)
+	if (bPregeneratePayloadsOnBeginPlay)
+	{
+		EnsureServer();
+		EnsureServerLibrary();
+	}
+
+	if (bRunScenario)
+	{
+		RunScenario();
+	}
+	else if (bRunSequence)
 	{
 		RunPhase0Sequence();
 	}
@@ -214,10 +264,17 @@ void ASTSTestbench::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	UDebugDrawService::Unregister(HudHandle);
 	HudHandle.Reset();
 
+	bScenarioRunning = false;
+	Spread.bActive = false;
+	BurstRepeat.bActive = false;
+
 	if (Recorder.IsRecording())
 	{
 		StopRecordingInternal();
 	}
+
+	// Stops the workers and frees every buffer still queued, in flight or waiting in the delay line.
+	ShutdownServer();
 
 	bCreationInProgress = false;
 	bAutoRecordPending = false;
@@ -243,6 +300,10 @@ void ASTSTestbench::Tick(float DeltaSeconds)
 	{
 		CreateTileSlice(TilesCreatedPerFrame);
 	}
+
+	ConsumeResponses(NowSec);
+	UpdateScenario(NowSec);
+	UpdateTimelines(NowSec);
 
 	if (bAutoRecordPending && NowSec >= AutoRecordStartSec)
 	{
@@ -355,6 +416,13 @@ FSTSTextureLook ASTSTestbench::GetLookForResolution(int32 Resolution) const
 
 void ASTSTestbench::EnsurePayloadLibrary(const TSet<int32>& Resolutions)
 {
+	if (PayloadLibraryVariant != DebugPreviewVariant)
+	{
+		PayloadLibrary.Reset();
+		PayloadLooks.Reset();
+		PayloadLibraryVariant = DebugPreviewVariant;
+	}
+
 	for (const int32 Resolution : Resolutions)
 	{
 		const FSTSTextureLook Look = GetLookForResolution(Resolution);
@@ -366,8 +434,8 @@ void ASTSTestbench::EnsurePayloadLibrary(const TSet<int32>& Resolutions)
 
 		const double StartSec = FPlatformTime::Seconds();
 		TSharedRef<FSTSMipChain> Chain = MakeShared<FSTSMipChain>();
-		FSTSDxt1Generator::GenerateChain(Resolution, Resolution, Look, 0, *Chain);
-		UE_LOG(LogSTS, Log, TEXT("Generated the %d payload: %d mips, %.2f MB in %.1f ms."), Resolution, Chain->Mips.Num(), Chain->TotalBytes / STS::MegaByte, (FPlatformTime::Seconds() - StartSec) * 1000.0);
+		FSTSDxt1Generator::GenerateChain(Resolution, Resolution, Look, uint32(FMath::Max(0, PayloadLibraryVariant)), *Chain);
+		UE_LOG(LogSTS, Log, TEXT("Generated the %d payload (variant %d): %d mips, %.2f MB in %.1f ms."), Resolution, PayloadLibraryVariant, Chain->Mips.Num(), Chain->TotalBytes / STS::MegaByte, (FPlatformTime::Seconds() - StartSec) * 1000.0);
 
 		PayloadLibrary.Add(Resolution, Chain);
 		PayloadLooks.Add(Resolution, Look);
@@ -416,6 +484,12 @@ bool ASTSTestbench::BuildTilePlan()
 	{
 		return Distances[A] < Distances[B] || (Distances[A] == Distances[B] && A < B);
 	});
+	for (int32 Rank = 0; Rank < NumTiles; ++Rank)
+	{
+		TilePlans[Order[Rank]].Rank = Rank;
+	}
+	ActiveCellsX = CellsX;
+	ActiveCellsY = CellsY;
 
 	int32 Remainder = RemainderResolution;
 	if (STS::ResolutionToBucket(Remainder) == INDEX_NONE)
@@ -535,11 +609,16 @@ void ASTSTestbench::CreateTile(const FSTSTilePlan& Plan)
 	Tile.Material = Material;
 	Tile.Texture = Texture;
 	Tile.Resolution = Plan.Resolution;
+	Tile.CellX = Plan.CellX;
+	Tile.CellY = Plan.CellY;
+	Tile.Rank = Plan.Rank;
+	Tile.LogicalResolution = Plan.Resolution;
 
 	const int32 Bucket = STS::ResolutionToBucket(Plan.Resolution);
 	if (Bucket != INDEX_NONE)
 	{
 		++TileCountsPerBucket[Bucket];
+		++LogicalCountsPerBucket[Bucket];
 	}
 	else
 	{
@@ -631,6 +710,7 @@ void ASTSTestbench::DestroyTiles()
 	Tiles.Empty();
 	FMemory::Memzero(TileCountsPerBucket);
 	TileCountsOtherResolution = 0;
+	ResetLogicalState();
 	TRACE_BOOKMARK(TEXT("STS Tiles Destroyed: %d"), NumDestroyed);
 
 	const double DestroyedSec = FPlatformTime::Seconds();
@@ -669,6 +749,7 @@ void ASTSTestbench::RegenerateTextures()
 
 	PayloadLibrary.Reset();
 	PayloadLooks.Reset();
+	ServerLibrary.Reset();
 
 	TSet<int32> Needed;
 	if (Tiles.IsEmpty())
@@ -805,7 +886,10 @@ void ASTSTestbench::StartRecordingNamed(const FString& Name, double DurationSec)
 	}
 
 	const FString OutputDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("SimTexStrm"));
-	Recorder.Start(Name, DurationSec, FPlatformTime::Seconds(), OutputDir);
+	if (Recorder.Start(Name, DurationSec, FPlatformTime::Seconds(), OutputDir))
+	{
+		Window = FUpdateWindow();
+	}
 }
 
 void ASTSTestbench::StopRecording()
@@ -862,6 +946,8 @@ void ASTSTestbench::OnEndFrame()
 		Sample.TexMB[Bucket] = float(TileCountsPerBucket[Bucket] * GetBucketChainMB(Bucket));
 	}
 
+	FillUpdateColumns(Sample);
+
 	AccumulateHudStats(NowSec, Sample);
 	if (Recorder.IsRecording())
 	{
@@ -883,12 +969,32 @@ void ASTSTestbench::AccumulateHudStats(double NowSec, const FSTSFrameSample& Sam
 	HudStats.MaxRHIMs = FMath::Max(HudStats.MaxRHIMs, Sample.RHIThreadMs);
 	HudStats.MaxGpuMs = FMath::Max(HudStats.MaxGpuMs, Sample.GpuMs);
 
-	if (NowSec - HudStats.WindowStartSec < HudWindowSec)
+	HudStats.Issued += Sample.RequestsIssued;
+	HudStats.Released += Sample.ResponsesReleased;
+	HudStats.ReleasedMB += Sample.ResponseMB;
+	HudStats.LatencySumMs += double(Sample.ResponseLatencyAvgMs) * Sample.ResponsesReleased;
+	HudStats.LatencyMaxMs = FMath::Max(HudStats.LatencyMaxMs, Sample.ResponseLatencyMaxMs);
+	HudStats.ConsumerSumMs += Sample.ConsumerMs;
+	HudStats.ConsumerMaxMs = FMath::Max(HudStats.ConsumerMaxMs, Sample.ConsumerMs);
+
+	const double WindowSec = NowSec - HudStats.WindowStartSec;
+	if (WindowSec < HudWindowSec)
 	{
 		return;
 	}
 
 	const double InvFrames = 1.0 / HudStats.Frames;
+	HudStats.IssuedPerSec = float(HudStats.Issued / WindowSec);
+	HudStats.ReleasedPerSec = float(HudStats.Released / WindowSec);
+	HudStats.MBPerSec = float(HudStats.ReleasedMB / WindowSec);
+	HudStats.LatencyAvgMs = HudStats.Released > 0 ? float(HudStats.LatencySumMs / HudStats.Released) : 0.0f;
+	HudStats.ShownLatencyMaxMs = HudStats.LatencyMaxMs;
+	HudStats.ConsumerAvgMs = float(HudStats.ConsumerSumMs * InvFrames);
+	HudStats.ShownConsumerMaxMs = HudStats.ConsumerMaxMs;
+	HudStats.Issued = HudStats.Released = 0;
+	HudStats.ReleasedMB = HudStats.LatencySumMs = HudStats.ConsumerSumMs = 0.0;
+	HudStats.LatencyMaxMs = HudStats.ConsumerMaxMs = 0.0f;
+
 	HudStats.AvgFrameMs = float(HudStats.SumFrameMs * InvFrames);
 	HudStats.Fps = HudStats.AvgFrameMs > 0.0f ? 1000.0f / HudStats.AvgFrameMs : 0.0f;
 	HudStats.AvgGameMs = float(HudStats.SumGameMs * InvFrames);
@@ -916,6 +1022,11 @@ void ASTSTestbench::RunPhase0Sequence()
 	if (SequenceStep != ESTSSequenceStep::Idle)
 	{
 		UE_LOG(LogSTS, Warning, TEXT("RunPhase0Sequence ignored: the sequence is already running."));
+		return;
+	}
+	if (bScenarioRunning)
+	{
+		UE_LOG(LogSTS, Warning, TEXT("RunPhase0Sequence ignored: a scenario is running."));
 		return;
 	}
 	if (Recorder.IsRecording())
@@ -1143,12 +1254,18 @@ void ASTSTestbench::GatherSummaryHeader(TArray<FString>& OutLines) const
 	OutLines.Add(FString::Printf(TEXT("Tiles alive at stop: %d (%s; total %.1f MB)"), Tiles.Num(), *PerResolution, TotalMB));
 	OutLines.Add(FString::Printf(TEXT("Last tile creation: %.1f ms game-thread time (tiles per frame knob: %d)"), LastCreationMs, TilesCreatedPerFrame));
 
+	GatherUpdateSummary(OutLines);
+
 	OutLines.Add(TEXT("Timing sources:"));
 	OutLines.Add(TEXT("  FrameMs: wall-clock delta between consecutive FCoreDelegates::OnEndFrame calls (no latency)."));
 	OutLines.Add(TEXT("  GameThreadMs: GGameThreadTime, busy time excluding waits; set in FViewport::Draw, so it covers the frame just ended."));
 	OutLines.Add(TEXT("  RenderThreadMs: GRenderThreadTime, busy time excluding idle; set after present on the render thread, lags about 1 frame."));
 	OutLines.Add(TEXT("  RHIThreadMs: GRHIThreadTime, busy time excluding waits; lags about 1 frame, 0 without an RHI thread."));
 	OutLines.Add(TEXT("  GpuMs: RHIGetGPUFrameCycles(0), timestamp-query history; lags 1-2 frames."));
+	if (Window.Issued > 0 || Window.Released > 0)
+	{
+		OutLines.Add(TEXT("  ConsumerMs, ChecksumMs, IssueMs: FPlatformTime deltas on the game thread inside Tick (drain + validate + free, checksum only, trigger selection + submit); per frame, no latency."));
+	}
 }
 
 // --- HUD ---
@@ -1163,7 +1280,7 @@ void ASTSTestbench::DrawHud(UCanvas* Canvas, APlayerController* /*Controller*/)
 	const double NowSec = FPlatformTime::Seconds();
 
 	TArray<TPair<FString, FLinearColor>> Lines;
-	Lines.Emplace(FString::Printf(TEXT("STS Phase 0 | %.1f fps | frame %.2f ms (max %.2f)"), HudStats.Fps, HudStats.AvgFrameMs, HudStats.ShownMaxFrameMs), FLinearColor::White);
+	Lines.Emplace(FString::Printf(TEXT("STS Phase 1 | %.1f fps | frame %.2f ms (max %.2f)"), HudStats.Fps, HudStats.AvgFrameMs, HudStats.ShownMaxFrameMs), FLinearColor::White);
 	Lines.Emplace(FString::Printf(TEXT("Game %.2f (%.2f) | Render %.2f (%.2f) | RHI %.2f (%.2f) | GPU %.2f (%.2f) ms, avg (max)"),
 		HudStats.AvgGameMs, HudStats.ShownMaxGameMs, HudStats.AvgRenderMs, HudStats.ShownMaxRenderMs, HudStats.AvgRHIMs, HudStats.ShownMaxRHIMs, HudStats.AvgGpuMs, HudStats.ShownMaxGpuMs), FLinearColor::White);
 
@@ -1193,6 +1310,8 @@ void ASTSTestbench::DrawHud(UCanvas* Canvas, APlayerController* /*Controller*/)
 	{
 		Lines.Emplace(FString::Printf(TEXT("Sequence: %s (%.1f s)"), GetSequenceStepName(SequenceStep), NowSec - SequenceStepStartSec), FLinearColor::Yellow);
 	}
+
+	AppendUpdateHud(Lines, NowSec);
 
 	if (NowSec - LastProfileRefreshSec >= 1.0)
 	{
