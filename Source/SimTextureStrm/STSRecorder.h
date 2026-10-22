@@ -6,7 +6,7 @@
 #include "STSTypes.h"
 #include "Tasks/Pipe.h"
 
-/** One CSV row. Columns reserved for later phases are written as 0 and are not stored. */
+/** One CSV row. CacheHits is still reserved for a later phase; it is written as 0 and not stored. */
 struct FSTSFrameSample
 {
 	// Phase 0 columns.
@@ -34,6 +34,25 @@ struct FSTSFrameSample
 	float ConsumerMs = 0.0f;
 	float ChecksumMs = 0.0f;
 	float IssueMs = 0.0f;
+
+	// Phase 2 columns. Uploads and UploadMB sit in the columns reserved for them; the rest are appended.
+	int32 Uploads = 0;
+	float UploadMB = 0.0f;
+	float BuildMs = 0.0f;
+	int32 BuildQueueDepth = 0;
+	float ApplyGTMs = 0.0f;
+	float UpdateResourceGTMs = 0.0f;
+	/** Render-thread time between the markers around UpdateResource; the samples arrive about one frame late. */
+	float RTCreateMs = 0.0f;
+	int32 FreeObjects[STS::NumBuckets] = {};
+	int32 MinReuseAgeFrames = -1;
+	int32 UnsafeReuses = 0;
+	int32 PoolExhausted = 0;
+	float IssueToVisibleAvgMs = 0.0f;
+	float IssueToVisibleMaxMs = 0.0f;
+	float ReleaseToVisibleMaxMs = 0.0f;
+	/** Negative when the RHI is not D3D12 or the query failed. */
+	float GpuLocalMemMB = -1.0f;
 };
 
 struct FSTSColumnStats

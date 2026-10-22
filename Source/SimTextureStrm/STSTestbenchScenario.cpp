@@ -54,6 +54,7 @@ void ASTSTestbench::BuildScenarioPreset(ESTSScenarioPreset Preset, TArray<FSTSSc
 	const auto AddFinish = [&Add]()
 	{
 		Add(ESTSScenarioStepType::WaitForIdle).DurationSec = PresetIdleTimeoutSec;
+		Add(ESTSScenarioStepType::CheckConsistency);
 		Add(ESTSScenarioStepType::RecordStop);
 	};
 
@@ -145,6 +146,37 @@ void ASTSTestbench::BuildScenarioPreset(ESTSScenarioPreset Preset, TArray<FSTSSc
 		Add(ESTSScenarioStepType::SpreadStop);
 		AddFinish();
 		break;
+
+	case ESTSScenarioPreset::SoakShort:
+	{
+		int32 CellsX = 0;
+		int32 CellsY = 0;
+		ResolveGrid(CellsX, CellsY, false);
+		const int32 PatchX = FMath::Min(6, CellsX);
+		const int32 PatchY = FMath::Min(6, CellsY);
+
+		AddPrologue(ESTSUpdatePattern::Oscillate, ESTSTargetMode::Patch);
+		FSTSScenarioStep& Mode = OutSteps[OutSteps.Num() - 2];
+		Mode.PatchCenter = FIntPoint(CellsX / 2, CellsY / 2);
+		Mode.PatchSize = FIntPoint(PatchX, PatchY);
+		Mode.PatchStep = FIntPoint(0, 0);
+
+		// Ten cycles of 30 s oscillating bursts and a 30 s idle gap: memory should return to the same level in every gap.
+		AddRecordStart(TEXT("SoakShort"));
+		for (int32 Cycle = 0; Cycle < 10; ++Cycle)
+		{
+			FSTSScenarioStep& Repeat = Add(ESTSScenarioStepType::BurstRepeat);
+			Repeat.Rate = 2.0f;
+			Repeat.DurationSec = 30.0f;
+			Repeat.Burst4k = 2 * PatchX * PatchY;
+			AddWait(30.0f);
+			Add(ESTSScenarioStepType::SpreadStop);
+			Add(ESTSScenarioStepType::WaitForIdle).DurationSec = PresetIdleTimeoutSec;
+			AddWait(30.0f);
+		}
+		AddFinish();
+		break;
+	}
 
 	case ESTSScenarioPreset::Overhead:
 		AddPrologue(ESTSUpdatePattern::Mixed, ESTSTargetMode::Random);
@@ -331,10 +363,15 @@ bool ASTSTestbench::ExecuteScenarioStep(const FSTSScenarioStep& Step, bool bFirs
 		}
 		if (Step.DurationSec > 0.0f && StepElapsedSec >= Step.DurationSec)
 		{
-			UE_LOG(LogSTS, Warning, TEXT("Scenario: WaitForIdle timed out after %.1f s with %d requests still in flight."), Step.DurationSec, Server->GetInFlight());
+			UE_LOG(LogSTS, Warning, TEXT("Scenario: WaitForIdle timed out after %.1f s with %d requests still in flight and %d build jobs outstanding."),
+				Step.DurationSec, Server ? Server->GetInFlight() : 0, (Builder ? Builder->GetOutstanding() : 0) + ApplyQueue.Num());
 			return true;
 		}
 		return false;
+
+	case ESTSScenarioStepType::CheckConsistency:
+		RunConsistencyCheck();
+		return true;
 
 	case ESTSScenarioStepType::CreateTiles:
 		if (bFirstFrame)

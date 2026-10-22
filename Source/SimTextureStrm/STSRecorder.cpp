@@ -19,7 +19,7 @@ namespace
 	constexpr float FrameBudgetMs60 = 16.67f;
 	constexpr float FrameBudgetMs30 = 33.33f;
 
-	const TCHAR* const CsvHeader = TEXT("Frame,TimeSec,FrameMs,GameThreadMs,RenderThreadMs,RHIThreadMs,GpuMs,TilesAlive,TexMB_512,TexMB_1k,TexMB_2k,TexMB_4k,ProcessPhysMB,RHITextureMB,Uploads,UploadMB,CacheHits,PendingRequests,RequestsIssued,ResponsesReleased,ResponseMB,ResponseLatencyAvgMs,ResponseLatencyMaxMs,StaleDiscarded,ChecksumFailures,ConsumerMs,ChecksumMs,IssueMs\n");
+	const TCHAR* const CsvHeader = TEXT("Frame,TimeSec,FrameMs,GameThreadMs,RenderThreadMs,RHIThreadMs,GpuMs,TilesAlive,TexMB_512,TexMB_1k,TexMB_2k,TexMB_4k,ProcessPhysMB,RHITextureMB,Uploads,UploadMB,CacheHits,PendingRequests,RequestsIssued,ResponsesReleased,ResponseMB,ResponseLatencyAvgMs,ResponseLatencyMaxMs,StaleDiscarded,ChecksumFailures,ConsumerMs,ChecksumMs,IssueMs,BuildMs,BuildQueueDepth,ApplyGTMs,UpdateResourceGTMs,RTCreateMs,Free512,Free1k,Free2k,Free4k,MinReuseAgeFrames,UnsafeReuses,PoolExhausted,IssueToVisibleAvgMs,IssueToVisibleMaxMs,ReleaseToVisibleMaxMs,GpuLocalMemMB\n");
 
 	void WriteUtf8(FArchive& Writer, const FString& Text)
 	{
@@ -165,14 +165,19 @@ void FSTSRecorder::FlushPending()
 	WritePipe->Launch(UE_SOURCE_LOCATION, [Writer, Chunk = MoveTemp(Chunk)]()
 	{
 		FString Text;
-		Text.Reserve(Chunk.Num() * 128);
+		Text.Reserve(Chunk.Num() * 256);
 		for (const FSTSFrameSample& Row : Chunk)
 		{
-			Text.Appendf(TEXT("%llu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,0,0,0,%d,%d,%d,%.3f,%.3f,%.3f,%d,%d,%.4f,%.4f,%.4f\n"),
+			Text.Appendf(TEXT("%llu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,%d,%.3f,0,%d,%d,%d,%.3f,%.3f,%.3f,%d,%d,%.4f,%.4f,%.4f,%.4f,%d,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.1f\n"),
 				Row.Frame, Row.TimeSec, Row.FrameMs, Row.GameThreadMs, Row.RenderThreadMs, Row.RHIThreadMs, Row.GpuMs,
 				Row.TilesAlive, Row.TexMB[0], Row.TexMB[1], Row.TexMB[2], Row.TexMB[3], Row.ProcessPhysMB, Row.RHITextureMB,
+				Row.Uploads, Row.UploadMB,
 				Row.PendingRequests, Row.RequestsIssued, Row.ResponsesReleased, Row.ResponseMB, Row.ResponseLatencyAvgMs, Row.ResponseLatencyMaxMs,
-				Row.StaleDiscarded, Row.ChecksumFailures, Row.ConsumerMs, Row.ChecksumMs, Row.IssueMs);
+				Row.StaleDiscarded, Row.ChecksumFailures, Row.ConsumerMs, Row.ChecksumMs, Row.IssueMs,
+				Row.BuildMs, Row.BuildQueueDepth, Row.ApplyGTMs, Row.UpdateResourceGTMs, Row.RTCreateMs,
+				Row.FreeObjects[0], Row.FreeObjects[1], Row.FreeObjects[2], Row.FreeObjects[3],
+				Row.MinReuseAgeFrames, Row.UnsafeReuses, Row.PoolExhausted,
+				Row.IssueToVisibleAvgMs, Row.IssueToVisibleMaxMs, Row.ReleaseToVisibleMaxMs, Row.GpuLocalMemMB);
 		}
 		WriteUtf8(*Writer, Text);
 	});

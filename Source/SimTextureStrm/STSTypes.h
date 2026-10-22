@@ -56,6 +56,16 @@ enum class ESTSTargetMode : uint8
 	Patch
 };
 
+/** What a released response does to the tile. Later phases add Regions, CustomUpdate and CustomLock. */
+UENUM(BlueprintType)
+enum class ESTSUploadMode : uint8
+{
+	/** Phase 1 behaviour: responses only update logical state. */
+	LogicalOnly,
+	/** Phase 2: the current production path (FIFO texture pools, background mip build, UpdateResource). */
+	Baseline
+};
+
 UENUM(BlueprintType)
 enum class ESTSScenarioStepType : uint8
 {
@@ -73,6 +83,8 @@ enum class ESTSScenarioStepType : uint8
 	SpreadStop,
 	/** Repeats the burst counts Rate times per second for DurationSec (timeline-based). */
 	BurstRepeat,
+	/** Logs and counts visual/logical/texture/MID mismatches over every tile. */
+	CheckConsistency,
 	Quit
 };
 
@@ -88,7 +100,9 @@ enum class ESTSScenarioPreset : uint8
 	/** Not in the spec: idle versus 50/s spread recordings for measuring the harness cost. */
 	Overhead,
 	/** Not in the spec: destroys and rebuilds the tiles while bursts are in flight (acceptance 8). */
-	Lifetime
+	Lifetime,
+	/** Not in the spec: 10 minutes of oscillating bursts with idle gaps, for the leak check (memory should return to one level between bursts). */
+	SoakShort
 };
 
 /** One scenario step; only the fields named in each comment are read for that step type. */

@@ -3,6 +3,7 @@
 #include "STSTestbench.h"
 
 #include "SimTextureStrm.h"
+#include "STSGpuMemory.h"
 #include "Camera/CameraComponent.h"
 #include "CanvasItem.h"
 #include "Components/SceneComponent.h"
@@ -216,6 +217,25 @@ void ASTSTestbench::BeginPlay()
 	FParse::Value(FCommandLine::Get(), TEXT("STSMaxInFlight="), ServerMaxInFlight);
 	FParse::Value(FCommandLine::Get(), TEXT("STSCorruptEveryN="), DebugCorruptEveryN);
 
+	FString ModeName;
+	if (FParse::Value(FCommandLine::Get(), TEXT("STSMode="), ModeName) && !ModeName.IsEmpty())
+	{
+		const int64 ModeValue = StaticEnum<ESTSUploadMode>()->GetValueByNameString(ModeName);
+		if (ModeValue == INDEX_NONE)
+		{
+			UE_LOG(LogSTS, Error, TEXT("-StsMode=%s is not an upload mode (LogicalOnly or Baseline); ignored."), *ModeName);
+		}
+		else
+		{
+			bUploadModeFromCommandLine = true;
+			CommandLineUploadMode = ESTSUploadMode(ModeValue);
+		}
+	}
+	FParse::Value(FCommandLine::Get(), TEXT("STSPoolSlack="), CommandLineSlack);
+	FParse::Value(FCommandLine::Get(), TEXT("STSBuilderThreads="), BaselineBuilderThreads);
+	FParse::Value(FCommandLine::Get(), TEXT("STSSafeReuseFrames="), SafeReuseFrames);
+	FParse::Value(FCommandLine::Get(), TEXT("STSRunTag="), RunTag);
+
 	UpdateStream.Initialize(UpdateSeed);
 	ResetTriggerState();
 
@@ -275,6 +295,8 @@ void ASTSTestbench::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 	// Stops the workers and frees every buffer still queued, in flight or waiting in the delay line.
 	ShutdownServer();
+	ShutdownBuilder();
+	TexturePool.Reset();
 
 	bCreationInProgress = false;
 	bAutoRecordPending = false;
@@ -302,6 +324,10 @@ void ASTSTestbench::Tick(float DeltaSeconds)
 	}
 
 	ConsumeResponses(NowSec);
+	if (ActiveUploadMode == ESTSUploadMode::Baseline)
+	{
+		ApplyBaselineJobs();
+	}
 	UpdateScenario(NowSec);
 	UpdateTimelines(NowSec);
 
@@ -547,6 +573,26 @@ void ASTSTestbench::CreateTiles()
 	EnsureMeshes();
 	BuildTilePlan();
 
+	ActiveUploadMode = bUploadModeFromCommandLine ? CommandLineUploadMode : UploadMode;
+	if (ActiveUploadMode == ESTSUploadMode::Baseline)
+	{
+		EnsureBuilder();
+		int32 PlannedPerBucket[STS::NumBuckets] = {};
+		for (const FSTSTilePlan& Plan : TilePlans)
+		{
+			const int32 Bucket = STS::ResolutionToBucket(Plan.Resolution);
+			if (Bucket != INDEX_NONE)
+			{
+				++PlannedPerBucket[Bucket];
+			}
+		}
+		CreatePoolSpares(PlannedPerBucket);
+	}
+	else
+	{
+		ShutdownBuilder();
+	}
+
 	CreationPrepSec = FPlatformTime::Seconds() - StartSec;
 	CreationBusySec = 0.0;
 	CreationWorstSliceSec = 0.0;
@@ -609,6 +655,7 @@ void ASTSTestbench::CreateTile(const FSTSTilePlan& Plan)
 	Tile.Material = Material;
 	Tile.Texture = Texture;
 	Tile.Resolution = Plan.Resolution;
+	Tile.VisualVariant = PayloadLibraryVariant;
 	Tile.CellX = Plan.CellX;
 	Tile.CellY = Plan.CellY;
 	Tile.Rank = Plan.Rank;
@@ -619,6 +666,10 @@ void ASTSTestbench::CreateTile(const FSTSTilePlan& Plan)
 	{
 		++TileCountsPerBucket[Bucket];
 		++LogicalCountsPerBucket[Bucket];
+		if (ActiveUploadMode == ESTSUploadMode::Baseline)
+		{
+			TexturePool.AddInUse(Texture, Bucket, true);
+		}
 	}
 	else
 	{
@@ -708,6 +759,8 @@ void ASTSTestbench::DestroyTiles()
 		}
 	}
 	Tiles.Empty();
+	TexturePool.Reset();
+	BurstBookmarks.Reset();
 	FMemory::Memzero(TileCountsPerBucket);
 	TileCountsOtherResolution = 0;
 	ResetLogicalState();
@@ -771,8 +824,13 @@ void ASTSTestbench::RegenerateTextures()
 		if (Texture)
 		{
 			Tile.Texture = Texture;
+			Tile.VisualVariant = PayloadLibraryVariant;
 			Tile.Material->SetTextureParameterValue(TextureParameterName, Texture);
 		}
+	}
+	if (ActiveUploadMode == ESTSUploadMode::Baseline)
+	{
+		RebuildPoolsFromTiles();
 	}
 
 	if (!Tiles.IsEmpty() && bForceGarbageCollectionOnDestroy)
@@ -886,7 +944,8 @@ void ASTSTestbench::StartRecordingNamed(const FString& Name, double DurationSec)
 	}
 
 	const FString OutputDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("SimTexStrm"));
-	if (Recorder.Start(Name, DurationSec, FPlatformTime::Seconds(), OutputDir))
+	const FString TaggedName = RunTag.IsEmpty() ? Name : Name + TEXT("_") + RunTag;
+	if (Recorder.Start(TaggedName, DurationSec, FPlatformTime::Seconds(), OutputDir))
 	{
 		Window = FUpdateWindow();
 	}
@@ -936,9 +995,11 @@ void ASTSTestbench::OnEndFrame()
 		FTextureMemoryStats TextureStats;
 		RHIGetTextureMemoryStats(TextureStats);
 		CachedRHITextureMB = float((TextureStats.StreamingMemorySize + TextureStats.NonStreamingMemorySize) / STS::MegaByte);
+		CachedGpuLocalMemMB = STSGpuMemory::QueryLocalUsageMB();
 	}
 	Sample.ProcessPhysMB = CachedProcessPhysMB;
 	Sample.RHITextureMB = CachedRHITextureMB;
+	Sample.GpuLocalMemMB = CachedGpuLocalMemMB;
 
 	Sample.TilesAlive = Tiles.Num();
 	for (int32 Bucket = 0; Bucket < STS::NumBuckets; ++Bucket)
@@ -1225,6 +1286,12 @@ void ASTSTestbench::GatherSummaryHeader(TArray<FString>& OutLines) const
 {
 	OutLines.Add(FString::Printf(TEXT("Build: %s%s"), LexToString(FApp::GetBuildConfiguration()), WITH_EDITOR ? TEXT(" (editor build)") : TEXT("")));
 	OutLines.Add(FString::Printf(TEXT("RHI: %s, adapter: %s"), GDynamicRHI ? GDynamicRHI->GetName() : TEXT("none"), *GRHIAdapterName));
+	{
+		const bool bTilesExist = !Tiles.IsEmpty();
+		const ESTSUploadMode Mode = bTilesExist ? ActiveUploadMode : (bUploadModeFromCommandLine ? CommandLineUploadMode : UploadMode);
+		OutLines.Add(FString::Printf(TEXT("Upload mode: %s (%s)"), *STS::EnumToString(Mode),
+			bUploadModeFromCommandLine ? TEXT("-StsMode on the command line") : TEXT("UploadMode knob")));
+	}
 
 	FIntPoint ViewportSize = FIntPoint::ZeroValue;
 	if (GEngine && GEngine->GameViewport && GEngine->GameViewport->Viewport)
@@ -1255,6 +1322,7 @@ void ASTSTestbench::GatherSummaryHeader(TArray<FString>& OutLines) const
 	OutLines.Add(FString::Printf(TEXT("Last tile creation: %.1f ms game-thread time (tiles per frame knob: %d)"), LastCreationMs, TilesCreatedPerFrame));
 
 	GatherUpdateSummary(OutLines);
+	GatherBaselineSummary(OutLines);
 
 	OutLines.Add(TEXT("Timing sources:"));
 	OutLines.Add(TEXT("  FrameMs: wall-clock delta between consecutive FCoreDelegates::OnEndFrame calls (no latency)."));
@@ -1280,7 +1348,7 @@ void ASTSTestbench::DrawHud(UCanvas* Canvas, APlayerController* /*Controller*/)
 	const double NowSec = FPlatformTime::Seconds();
 
 	TArray<TPair<FString, FLinearColor>> Lines;
-	Lines.Emplace(FString::Printf(TEXT("STS Phase 1 | %.1f fps | frame %.2f ms (max %.2f)"), HudStats.Fps, HudStats.AvgFrameMs, HudStats.ShownMaxFrameMs), FLinearColor::White);
+	Lines.Emplace(FString::Printf(TEXT("STS Phase 2 (%s) | %.1f fps | frame %.2f ms (max %.2f)"), *STS::EnumToString(ActiveUploadMode), HudStats.Fps, HudStats.AvgFrameMs, HudStats.ShownMaxFrameMs), FLinearColor::White);
 	Lines.Emplace(FString::Printf(TEXT("Game %.2f (%.2f) | Render %.2f (%.2f) | RHI %.2f (%.2f) | GPU %.2f (%.2f) ms, avg (max)"),
 		HudStats.AvgGameMs, HudStats.ShownMaxGameMs, HudStats.AvgRenderMs, HudStats.ShownMaxRenderMs, HudStats.AvgRHIMs, HudStats.ShownMaxRHIMs, HudStats.AvgGpuMs, HudStats.ShownMaxGpuMs), FLinearColor::White);
 
@@ -1312,6 +1380,7 @@ void ASTSTestbench::DrawHud(UCanvas* Canvas, APlayerController* /*Controller*/)
 	}
 
 	AppendUpdateHud(Lines, NowSec);
+	AppendBaselineHud(Lines);
 
 	if (NowSec - LastProfileRefreshSec >= 1.0)
 	{

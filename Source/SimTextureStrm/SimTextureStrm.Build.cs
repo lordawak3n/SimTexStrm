@@ -12,6 +12,12 @@ public class SimTextureStrm : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[] { "RenderCore", "RHI", "MeshDescription", "StaticMeshDescription" });
 
+		// STSGpuMemory queries DXGI video memory usage on the adapter the D3D12 RHI uses.
+		if (Target.Platform == UnrealTargetPlatform.Win64)
+		{
+			PublicSystemLibraries.Add("dxgi.lib");
+		}
+
 		// Uncomment if you are using Slate UI
 		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
 		

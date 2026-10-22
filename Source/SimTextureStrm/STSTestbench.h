@@ -6,8 +6,11 @@
 #include "GameFramework/Actor.h"
 #include "Math/RandomStream.h"
 #include "STSDxt1Generator.h"
+#include "STSMipBuilder.h"
 #include "STSRecorder.h"
+#include "STSRenderTiming.h"
 #include "STSTerrainServer.h"
+#include "STSTexturePool.h"
 #include "STSTypes.h"
 #include "STSTestbench.generated.h"
 
@@ -36,8 +39,11 @@ struct FSTSTile
 	UPROPERTY(Transient)
 	TObjectPtr<UTexture2D> Texture;
 
-	/** The visual (Phase 0) resolution of the texture that is actually on the tile. */
+	/** The visual resolution of the texture that is actually on the tile. Follows the logical one only in Baseline mode. */
 	int32 Resolution = 0;
+
+	/** The variant of the texture that is actually on the tile. */
+	int32 VisualVariant = 0;
 
 	int32 CellX = 0;
 	int32 CellY = 0;
@@ -78,7 +84,8 @@ enum class ESTSSequenceStep : uint8
  * Phase 0 static harness: a grid of procedural triangle tiles with procedural DXT1 textures,
  * a benchmark recorder, a HUD and console commands (see STSConsoleCommands.cpp).
  * Phase 1 adds the synthetic terrain server, update triggers and the scenario runner
- * (STSTestbenchUpdates.cpp, STSTestbenchScenario.cpp). Responses are validated and accounted for; no texture is updated.
+ * (STSTestbenchUpdates.cpp, STSTestbenchScenario.cpp). In LogicalOnly mode responses are validated and accounted for; no texture is updated.
+ * Phase 2 adds the Baseline upload mode (STSTestbenchBaseline.cpp): the current production path, reproduced as it is.
  */
 UCLASS(Blueprintable)
 class SIMTEXTURESTRM_API ASTSTestbench : public AActor
@@ -139,6 +146,16 @@ public:
 	/** Replaces ScenarioSteps with the steps of ScenarioPreset (Custom leaves them untouched). */
 	UFUNCTION(CallInEditor, BlueprintCallable, Category = "STS|Scenario")
 	void ApplyScenarioPreset();
+
+	/** Checks every tile: visual state equals logical state (Baseline mode only), texture size equals visual resolution, MID texture is the tile's texture. Logs the mismatches. */
+	UFUNCTION(CallInEditor, BlueprintCallable, Category = "STS|Baseline")
+	void CheckConsistency();
+
+	/** Returns the mismatch count. */
+	int32 RunConsistencyCheck();
+
+	/** The mode the existing tiles were created with; UploadMode and -StsMode only apply when tiles are created. */
+	ESTSUploadMode GetActiveUploadMode() const { return ActiveUploadMode; }
 
 	void StartRecordingNamed(const FString& Name, double DurationSec);
 	void SetHudVisible(bool bVisible) { bShowHud = bVisible; }
@@ -348,6 +365,33 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates|Server")
 	bool bPregeneratePayloadsOnBeginPlay = false;
 
+	// --- STS|Baseline ---
+
+	/** What a released response does to its tile. Fixed while tiles exist; a change takes effect on RebuildTiles. -StsMode=LogicalOnly|Baseline overrides it. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Baseline")
+	ESTSUploadMode UploadMode = ESTSUploadMode::Baseline;
+
+	/** Spare textures per resolution, on top of the ones in use, created with the tiles. -1 is automatic: 100% of the tiles at that resolution, at least 32. -STSPoolSlack=N sets all four. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Baseline", meta = (ClampMin = "-1"))
+	int32 PoolSlack512 = -1;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Baseline", meta = (ClampMin = "-1"))
+	int32 PoolSlack1k = -1;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Baseline", meta = (ClampMin = "-1"))
+	int32 PoolSlack2k = -1;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Baseline", meta = (ClampMin = "-1"))
+	int32 PoolSlack4k = -1;
+
+	/** Dedicated threads building the mips. Fixed once the first tiles are created in Baseline mode. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Baseline", meta = (ClampMin = "1", ClampMax = "16"))
+	int32 BaselineBuilderThreads = 1;
+
+	/** A texture taken from a queue fewer than this many frames after it was released counts as an unsafe reuse. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Baseline", meta = (ClampMin = "0"))
+	int32 SafeReuseFrames = 3;
+
 	// --- STS|Updates ---
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Updates")
@@ -518,6 +562,20 @@ private:
 		double ConsumerMs = 0.0;
 		double ChecksumMs = 0.0;
 		double IssueMs = 0.0;
+
+		// Phase 2.
+		int32 Uploads = 0;
+		double UploadBytes = 0.0;
+		double BuildMs = 0.0;
+		double ApplyMs = 0.0;
+		double UpdateResourceMs = 0.0;
+		double RTCreateMs = 0.0;
+		int32 MinReuseAge = -1;
+		int32 UnsafeReuses = 0;
+		int32 PoolExhausted = 0;
+		double IssueToVisibleSumMs = 0.0;
+		double IssueToVisibleMaxMs = 0.0;
+		double ReleaseToVisibleMaxMs = 0.0;
 	};
 
 	/** The outcome of one trigger (a burst, or the requests due in one spread frame). */
@@ -559,6 +617,35 @@ private:
 		TArray<float> ChecksumMs;
 		TArray<float> IssueMs;
 		TArray<FString> BurstLines;
+
+		// Phase 2.
+		int64 Uploads = 0;
+		int64 UnsafeReuses = 0;
+		int64 PoolExhausted = 0;
+		int64 StaleBuildJobs = 0;
+		int64 ConsistencyChecks = 0;
+		int64 ConsistencyMismatches = 0;
+		double UploadBytes = 0.0;
+		float PeakProcessPhysMB = 0.0f;
+		float PeakRHITextureMB = 0.0f;
+		float PeakGpuLocalMemMB = -1.0f;
+		float EndProcessPhysMB = 0.0f;
+		float EndRHITextureMB = 0.0f;
+		float EndGpuLocalMemMB = -1.0f;
+		TArray<float> ReuseAgeFrames;
+		TArray<float> IssueToVisibleMs;
+		TArray<float> ApplyGTMs;
+		TArray<float> UpdateResourceGTMs;
+		TArray<float> RTCreateMs[STS::NumBuckets];
+		TArray<float> BuildMs[STS::NumBuckets];
+	};
+
+	/** The request IDs of one burst, so the trace bookmark can be placed on its first apply. */
+	struct FBurstBookmark
+	{
+		int64 FirstRequestId = 0;
+		int64 EndRequestId = 0;
+		int32 Number = 0;
 	};
 
 	/** A timeline-driven trigger: item k is due at StartSec + k / Rate. */
@@ -643,10 +730,26 @@ private:
 
 	// Consumer (STSTestbenchUpdates.cpp)
 	void ConsumeResponses(double NowSec);
-	void ProcessResponse(const FSTSResponse& Response, double NowSec);
+	void ProcessResponse(FSTSResponse& Response, double NowSec);
 	void FillUpdateColumns(FSTSFrameSample& Sample);
 	void GatherUpdateSummary(TArray<FString>& OutLines) const;
 	void AppendUpdateHud(TArray<TPair<FString, FLinearColor>>& Lines, double NowSec) const;
+
+	// Baseline upload path (STSTestbenchBaseline.cpp)
+	int32 GetPoolSlack(int32 Bucket, int32 TilesAtBucket) const;
+	void CreatePoolSpares(const int32* TilesPerBucket);
+	void RebuildPoolsFromTiles();
+	void EnsureBuilder();
+	void ShutdownBuilder();
+	void SubmitBuildJob(FSTSResponse& Response, double NowSec);
+	void ApplyBaselineJobs();
+	bool ApplyBuildJob(FSTSBuildJob& Job);
+	void NoteBurstIssued(int64 FirstRequestId, int64 EndRequestId);
+	void FillBaselineColumns(FSTSFrameSample& Sample);
+	void GatherBaselineSummary(TArray<FString>& OutLines) const;
+	void GatherKeyStats(TArray<FString>& OutLines) const;
+	void AppendBaselineHud(TArray<TPair<FString, FLinearColor>>& Lines) const;
+	bool IsBaselineIdle() const;
 
 	// Scenario (STSTestbenchScenario.cpp)
 	void BuildScenarioPreset(ESTSScenarioPreset Preset, TArray<FSTSScenarioStep>& OutSteps) const;
@@ -742,6 +845,34 @@ private:
 	double TotalChecksumMs = 0.0;
 	double TotalChecksumBytes = 0.0;
 	double LastChecksumMsPerMB = 0.0;
+
+	// --- Phase 2: Baseline upload path ---
+
+	ESTSUploadMode ActiveUploadMode = ESTSUploadMode::LogicalOnly;
+	bool bUploadModeFromCommandLine = false;
+	ESTSUploadMode CommandLineUploadMode = ESTSUploadMode::Baseline;
+	int32 CommandLineSlack = -1;
+	/** From -STSRunTag=; appended to every recording name so repeated runs write distinct, identifiable files. */
+	FString RunTag;
+	int32 PoolSlackUsed[STS::NumBuckets] = {};
+
+	FSTSTexturePool TexturePool;
+	TUniquePtr<FSTSMipBuilder> Builder;
+	FSTSRenderTimer RenderTimer;
+	/** Finished jobs in completion order, waiting for an object; jobs that found their queue empty stay here. */
+	TArray<FSTSBuildJob> ApplyQueue;
+	TArray<FSTSBuildJob> FinishedScratch;
+	TArray<FSTSRenderTimingSample> RenderSamplesScratch;
+	TArray<FBurstBookmark> BurstBookmarks;
+	int32 BurstSerial = 0;
+	float CachedGpuLocalMemMB = -1.0f;
+
+	int64 TotalUploads = 0;
+	int64 TotalUnsafeReuses = 0;
+	int64 TotalPoolExhausted = 0;
+	int64 TotalConsistencyMismatches = 0;
+	int32 LoggedUnsafeReuses = 0;
+	int32 LoggedPoolExhausted = 0;
 
 	TArray<FSTSScenarioStep> ScenarioRuntimeSteps;
 	bool bScenarioRunning = false;

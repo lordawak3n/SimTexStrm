@@ -174,7 +174,7 @@ namespace
 
 	FAutoConsoleCommandWithWorldAndArgs ScenarioApplyCommand(
 		TEXT("sts.Scenario.Apply"),
-		TEXT("sts.Scenario.Apply <Preset>: fills ScenarioSteps from a preset (SteadySpread, SpreadSweep, Burst, Oscillation, Soak, Overhead, Lifetime)."),
+		TEXT("sts.Scenario.Apply <Preset>: fills ScenarioSteps from a preset (SteadySpread, SpreadSweep, Burst, Oscillation, Soak, Overhead, Lifetime, SoakShort)."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
 		{
 			ASTSTestbench* Testbench = FindTestbench(World, TEXT("sts.Scenario.Apply"));
@@ -219,5 +219,16 @@ namespace
 				return;
 			}
 			Testbench->SetChecksumsEnabled(Args.IsValidIndex(0) ? FCString::Atoi(*Args[0]) != 0 : !Testbench->AreChecksumsEnabled());
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CheckConsistencyCommand(
+		TEXT("sts.Check.Consistency"),
+		TEXT("Checks every tile (visual state equals logical state in Baseline mode, texture size equals visual resolution, MID texture is the tile's texture) and logs the mismatches."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+		{
+			if (ASTSTestbench* Testbench = FindTestbench(World, TEXT("sts.Check.Consistency")))
+			{
+				Testbench->CheckConsistency();
+			}
 		}));
 }

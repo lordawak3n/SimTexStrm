@@ -85,7 +85,7 @@ void ASTSTestbench::ApplyServerSettings()
 
 bool ASTSTestbench::IsServerIdle() const
 {
-	return !Server || Server->GetInFlight() == 0;
+	return (!Server || Server->GetInFlight() == 0) && IsBaselineIdle();
 }
 
 bool ASTSTestbench::EnsureServerLibrary()
@@ -140,6 +140,10 @@ void ASTSTestbench::ResetLogicalState()
 
 	// Responses of the old epoch are discarded and counted as stale when the server next drains.
 	++TileEpoch;
+	if (Builder)
+	{
+		Builder->SetEpoch(TileEpoch);
+	}
 	if (Server)
 	{
 		Server->SetEpoch(TileEpoch);
@@ -619,6 +623,7 @@ void ASTSTestbench::IssueBatch(const TArray<TPair<int32, double>>& Targets, bool
 
 	if (bBurst)
 	{
+		NoteBurstIssued(NextRequestId - Result.Issued, NextRequestId);
 		LastBurst = Result;
 		bHasLastBurst = true;
 		TRACE_BOOKMARK(TEXT("STS Burst: %d/%d"), Result.Issued, Result.Requested);
@@ -686,7 +691,7 @@ void ASTSTestbench::ConsumeResponses(double NowSec)
 		}
 		LastServerCounters = Counters;
 
-		for (const FSTSResponse& Response : ReleasedScratch)
+		for (FSTSResponse& Response : ReleasedScratch)
 		{
 			ProcessResponse(Response, NowSec);
 		}
@@ -695,10 +700,12 @@ void ASTSTestbench::ConsumeResponses(double NowSec)
 	Frame.ConsumerMs += ElapsedMsSince(StartSec);
 }
 
-void ASTSTestbench::ProcessResponse(const FSTSResponse& Response, double NowSec)
+void ASTSTestbench::ProcessResponse(FSTSResponse& Response, double NowSec)
 {
 	const FSTSRequest& Request = Response.Request;
 	const bool bRecording = Recorder.IsRecording();
+	const bool bBaseline = ActiveUploadMode == ESTSUploadMode::Baseline;
+	bool bSubmitBuild = false;
 
 	if (bVerifyChecksums)
 	{
@@ -749,7 +756,15 @@ void ASTSTestbench::ProcessResponse(const FSTSResponse& Response, double NowSec)
 			}
 			Tile.LogicalResolution = Request.Resolution;
 			Tile.LogicalVariant = Request.Variant;
-			Tile.PendingRequestId = INDEX_NONE;
+			if (bBaseline)
+			{
+				// The request stays pending until the apply step has put the texture on the tile.
+				bSubmitBuild = true;
+			}
+			else
+			{
+				Tile.PendingRequestId = INDEX_NONE;
+			}
 		}
 		else if (bRecording)
 		{
@@ -769,6 +784,11 @@ void ASTSTestbench::ProcessResponse(const FSTSResponse& Response, double NowSec)
 		Window.ReleaseLagMs.Add(float((NowSec - Response.ReadyTimeSec) * 1000.0));
 		Window.ModelLatencyMs.Add(float((Response.ReadyTimeSec - Request.IssueTimeSec) * 1000.0));
 	}
+
+	if (bSubmitBuild)
+	{
+		SubmitBuildJob(Response, NowSec);
+	}
 }
 
 void ASTSTestbench::FillUpdateColumns(FSTSFrameSample& Sample)
@@ -784,6 +804,7 @@ void ASTSTestbench::FillUpdateColumns(FSTSFrameSample& Sample)
 	Sample.ConsumerMs = float(Frame.ConsumerMs);
 	Sample.ChecksumMs = float(Frame.ChecksumMs);
 	Sample.IssueMs = float(Frame.IssueMs);
+	FillBaselineColumns(Sample);
 
 	if (Recorder.IsRecording())
 	{
@@ -809,7 +830,7 @@ void ASTSTestbench::GatherUpdateSummary(TArray<FString>& OutLines) const
 	}
 
 	OutLines.Add(FString());
-	OutLines.Add(TEXT("Terrain server (Phase 1; no texture is updated by responses):"));
+	OutLines.Add(TEXT("Terrain server and update stream (Phase 1):"));
 	OutLines.Add(FString::Printf(TEXT("  Server: %d workers, latency %.1f +/- %.1f ms, bandwidth %s, max in flight %s, %d variants per resolution, checksums %s%s"),
 		Server ? Server->GetWorkerCount() : ServerWorkerCount, ServerLatencyMs, ServerLatencyJitterMs,
 		ServerLinkBandwidthMBps > 0.0f ? *FString::Printf(TEXT("%.0f MB/s"), ServerLinkBandwidthMBps) : TEXT("unlimited"),

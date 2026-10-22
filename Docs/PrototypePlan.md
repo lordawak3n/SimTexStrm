@@ -61,7 +61,7 @@ A static scene of 1000 procedural triangle tiles (configurable), with a procedur
 
 **Milestone 0:** correct visuals, and noise-floor recordings **before and after** tile creation.
 
-### Phase 1 – Synthetic terrain server and update knobs
+### Phase 1 – Synthetic terrain server and update knobs (status: done, signed off)
 Specification: [`Phase1_TerrainServer.md`](Phase1_TerrainServer.md).
 
 - Worker-thread "server" that answers (tile ID, resolution) requests with DXT1 payloads plus full mip chains, after a configurable delay. Payloads are served from a pre-generated library (memcpy), so generation cost doesn't pollute measurements.
@@ -76,15 +76,19 @@ Specification: [`Phase1_TerrainServer.md`](Phase1_TerrainServer.md).
 
 **Milestone 1:** the knobs produce the expected request streams, and payloads are verified (checksums and visual check).
 
-### Phase 2 – Baseline (the current production path, i.e. the "before")
-- Pooled `UTexture2D` objects in a circular FIFO queue (return at one end, take from the other).
-- A background thread builds `FTexture2DMipMap` data, and the game thread copies it into `PlatformData`.
-- `UpdateResource`, a wait of N frames (knob), then the MID texture parameter is swapped.
+### Phase 2 – Baseline (the current production path, i.e. the "before") (status: done; formal suite deferred to Phase 3 acceptance)
+Specification: [`Phase2_Baseline.md`](Phase2_Baseline.md).
+
+- One circular FIFO queue of `UTexture2D` objects **per resolution** (return at the top, take from the bottom).
+- A background thread allocates `FTexture2DMipMap` objects and copies each mip into their bulk data. The game thread hands them to `PlatformData->Mips` with `Add()` (an ownership transfer, not a copy), then calls `UpdateResource`.
+- The MID texture parameter is set right away. There is no frame wait: safety comes only from a large pool (reuse age), which the harness measures.
 - Selected with `-StsMode=Baseline`.
 
 **Milestone 2:** "before" numbers for every test scenario.
 
 ### Phase 3 – Per-size pools + `UpdateTextureRegions`
+Specification: [`Phase3_RegionsPool.md`](Phase3_RegionsPool.md). It also fixes the thread-time capture, turns checksums off for performance runs, and adds a `BaselineSingleUse` variant (Baseline with `BULKDATA_SingleUse` mips: a candidate one-line production patch).
+
 - One pool per resolution. Each slot calls `UpdateResource` exactly once at startup, then `PlatformData` is released.
 - One `UpdateTextureRegions` call per mip, each a whole-mip region with the DXT1 pitch.
 - Pooled source buffers and region arrays, returned by the cleanup callback.
@@ -97,6 +101,8 @@ Specification: [`Phase1_TerrainServer.md`](Phase1_TerrainServer.md).
 **Milestone 3:** tail mips (2×2, 1×1) verified, a direct comparison against Phase 2, and the per-call vs. per-byte cost breakdown (which sets expectations for Phase 4).
 
 ### Phase 4 – Custom `ENQUEUE_RENDER_COMMAND` uploader (moved ahead of budget/cache)
+**Revised after reading the 5.6 source (see `Phase3_RegionsPool.md` §0.4):** D3D12 already writes whole-mip updates straight into locked upload memory, so `CustomLock` is redundant and is dropped. What is left of Phase 4 is batching (one render command per frame instead of one per mip). **Gate:** do Phase 4 only if Phase 3's cost model shows that fixed cost per call × calls per burst frame is worth recovering (roughly > 1 ms). Otherwise go straight to Phase 5 with the Regions uploader.
+
 - **One render command per frame** that processes every pending texture update. Within it, mips are still uploaded one at a time: D3D12 copies one sub-resource per copy, and upload memory needs rows on 256-byte and mips on 512-byte boundaries, so small DXT1 mips must be re-packed row by row.
 - Two variants behind the Phase 3 uploader interface:
   - `-StsMode=CustomUpdate`: `RHIUpdateTexture2D` per mip, from inside the single command.
