@@ -165,6 +165,11 @@ void FSTSMipBuilder::Process(FSTSBuildJob& Job)
 			void* Dest = Mip->BulkData.Realloc(Range.Size);
 			FMemory::Memcpy(Dest, Job.Buffer.GetData() + Range.Offset, Range.Size);
 			Mip->BulkData.Unlock();
+			if (Job.bSingleUse)
+			{
+				// FBulkData::Unlock frees single-use data, so the flag goes on after the fill.
+				Mip->BulkData.SetBulkDataFlags(BULKDATA_SingleUse);
+			}
 			Job.Mips.Add(MoveTemp(Mip));
 		}
 	}

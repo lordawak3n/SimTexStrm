@@ -56,14 +56,18 @@ enum class ESTSTargetMode : uint8
 	Patch
 };
 
-/** What a released response does to the tile. Later phases add Regions, CustomUpdate and CustomLock. */
+/** What a released response does to the tile. Later phases add CustomUpdate and CustomLock. */
 UENUM(BlueprintType)
 enum class ESTSUploadMode : uint8
 {
 	/** Phase 1 behaviour: responses only update logical state. */
 	LogicalOnly,
 	/** Phase 2: the current production path (FIFO texture pools, background mip build, UpdateResource). */
-	Baseline
+	Baseline,
+	/** Phase 3: Baseline, with BULKDATA_SingleUse on every mip built for PlatformData, so UpdateResource takes the memory instead of copying it. */
+	BaselineSingleUse,
+	/** Phase 3: per-resolution FIFO pools of pre-created GPU textures, updated in place with UpdateTextureRegions straight from the response buffer. */
+	Regions
 };
 
 UENUM(BlueprintType)
@@ -189,6 +193,18 @@ namespace STS
 	}
 
 	constexpr double MegaByte = 1024.0 * 1024.0;
+
+	/** Baseline and BaselineSingleUse share the builder, the apply queue and UpdateResource. */
+	inline bool IsBaselineFamily(ESTSUploadMode Mode)
+	{
+		return Mode == ESTSUploadMode::Baseline || Mode == ESTSUploadMode::BaselineSingleUse;
+	}
+
+	/** Modes that put response content on the tiles (everything but LogicalOnly). */
+	inline bool UpdatesVisuals(ESTSUploadMode Mode)
+	{
+		return Mode != ESTSUploadMode::LogicalOnly;
+	}
 
 	template <typename EnumType>
 	FString EnumToString(EnumType Value)

@@ -25,6 +25,8 @@ struct FSTSBuildJob
 	double BuildMs = 0.0;
 	/** The builder skipped the work because the epoch was already stale. */
 	bool bBuildSkipped = false;
+	/** BaselineSingleUse: every finished mip gets BULKDATA_SingleUse (set after Unlock, which would free single-use data). */
+	bool bSingleUse = false;
 	/** Game thread only: PoolExhausted was already counted for this job. */
 	bool bExhaustedCounted = false;
 };

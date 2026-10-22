@@ -81,11 +81,12 @@ void ASTSTestbench::ApplyServerSettings()
 	Settings.MaxInFlight = ServerMaxInFlight;
 	Settings.CorruptEveryN = DebugCorruptEveryN;
 	Server->SetSettings(Settings);
+	Server->SetBufferPool(ActiveUploadMode == ESTSUploadMode::Regions ? BufferPool : nullptr);
 }
 
 bool ASTSTestbench::IsServerIdle() const
 {
-	return (!Server || Server->GetInFlight() == 0) && IsBaselineIdle();
+	return (!Server || Server->GetInFlight() == 0) && IsUploadPathIdle();
 }
 
 bool ASTSTestbench::EnsureServerLibrary()
@@ -704,8 +705,10 @@ void ASTSTestbench::ProcessResponse(FSTSResponse& Response, double NowSec)
 {
 	const FSTSRequest& Request = Response.Request;
 	const bool bRecording = Recorder.IsRecording();
-	const bool bBaseline = ActiveUploadMode == ESTSUploadMode::Baseline;
+	const bool bBaseline = STS::IsBaselineFamily(ActiveUploadMode);
+	const bool bRegions = ActiveUploadMode == ESTSUploadMode::Regions;
 	bool bSubmitBuild = false;
+	bool bSubmitUpload = false;
 
 	if (bVerifyChecksums)
 	{
@@ -756,10 +759,11 @@ void ASTSTestbench::ProcessResponse(FSTSResponse& Response, double NowSec)
 			}
 			Tile.LogicalResolution = Request.Resolution;
 			Tile.LogicalVariant = Request.Variant;
-			if (bBaseline)
+			if (bBaseline || bRegions)
 			{
 				// The request stays pending until the apply step has put the texture on the tile.
-				bSubmitBuild = true;
+				bSubmitBuild = bBaseline;
+				bSubmitUpload = bRegions;
 			}
 			else
 			{
@@ -788,6 +792,15 @@ void ASTSTestbench::ProcessResponse(FSTSResponse& Response, double NowSec)
 	if (bSubmitBuild)
 	{
 		SubmitBuildJob(Response, NowSec);
+	}
+	else if (bSubmitUpload)
+	{
+		SubmitRegionsUpload(Response, NowSec);
+	}
+	else if (bRegions)
+	{
+		// Superseded or for a tile that is gone: nothing will upload it, so its buffer goes back to the pool.
+		ReleaseResponseBuffer(Request, MoveTemp(Response.Buffer));
 	}
 }
 

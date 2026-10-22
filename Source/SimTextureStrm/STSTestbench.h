@@ -10,11 +10,14 @@
 #include "STSRecorder.h"
 #include "STSRenderTiming.h"
 #include "STSTerrainServer.h"
+#include "STSTextureUploader.h"
 #include "STSTexturePool.h"
+#include "STSThreadTimes.h"
 #include "STSTypes.h"
 #include "STSTestbench.generated.h"
 
 class APlayerController;
+class FTextureResource;
 class UCameraComponent;
 class UCanvas;
 class UMaterialInstanceDynamic;
@@ -47,6 +50,9 @@ struct FSTSTile
 
 	int32 CellX = 0;
 	int32 CellY = 0;
+
+	/** Updates applied to this tile since it was created. */
+	int32 UpdateCount = 0;
 
 	/** Distance rank from the grid centre; the ranking that assigns the resolution rings. */
 	int32 Rank = 0;
@@ -86,6 +92,8 @@ enum class ESTSSequenceStep : uint8
  * Phase 1 adds the synthetic terrain server, update triggers and the scenario runner
  * (STSTestbenchUpdates.cpp, STSTestbenchScenario.cpp). In LogicalOnly mode responses are validated and accounted for; no texture is updated.
  * Phase 2 adds the Baseline upload mode (STSTestbenchBaseline.cpp): the current production path, reproduced as it is.
+ * Phase 3 adds BaselineSingleUse (Baseline with BULKDATA_SingleUse mips) and the Regions mode (STSTestbenchRegions.cpp):
+ * pre-created GPU slots updated in place with UpdateTextureRegions.
  */
 UCLASS(Blueprintable)
 class SIMTEXTURESTRM_API ASTSTestbench : public AActor
@@ -147,12 +155,19 @@ public:
 	UFUNCTION(CallInEditor, BlueprintCallable, Category = "STS|Scenario")
 	void ApplyScenarioPreset();
 
-	/** Checks every tile: visual state equals logical state (Baseline mode only), texture size equals visual resolution, MID texture is the tile's texture. Logs the mismatches. */
+	/** Checks every tile: visual state equals logical state (every mode that updates visuals), texture size equals visual resolution, MID texture is the tile's texture, a Regions slot kept its GPU resource. Logs the mismatches. */
 	UFUNCTION(CallInEditor, BlueprintCallable, Category = "STS|Baseline")
 	void CheckConsistency();
 
 	/** Returns the mismatch count. */
 	int32 RunConsistencyCheck();
+
+	/** Regions mode: reads every mip of ReadbackSlotsPerResolution in-use slots per resolution back from the GPU and compares it with the payload each slot should hold. Stalls the GPU. */
+	UFUNCTION(CallInEditor, BlueprintCallable, Category = "STS|Regions")
+	void CheckReadbackMips();
+
+	/** OnlyResolution 0 checks every resolution. Returns the number of mismatching mips. */
+	int32 RunReadbackMips(int32 OnlyResolution);
 
 	/** The mode the existing tiles were created with; UploadMode and -StsMode only apply when tiles are created. */
 	ESTSUploadMode GetActiveUploadMode() const { return ActiveUploadMode; }
@@ -367,7 +382,7 @@ public:
 
 	// --- STS|Baseline ---
 
-	/** What a released response does to its tile. Fixed while tiles exist; a change takes effect on RebuildTiles. -StsMode=LogicalOnly|Baseline overrides it. */
+	/** What a released response does to its tile. Fixed while tiles exist; a change takes effect on RebuildTiles. -StsMode=LogicalOnly|Baseline|BaselineSingleUse|Regions overrides it. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Baseline")
 	ESTSUploadMode UploadMode = ESTSUploadMode::Baseline;
 
@@ -391,6 +406,29 @@ public:
 	/** A texture taken from a queue fewer than this many frames after it was released counts as an unsafe reuse. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Baseline", meta = (ClampMin = "0"))
 	int32 SafeReuseFrames = 3;
+
+	// --- STS|Regions ---
+
+	/** Response buffers pooled per resolution in Regions mode, created with the tiles. They cover the responses in flight plus the uploads queued; a miss allocates and is counted (BufferPoolMisses). -STSBufferPool=N sets all four. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Regions", meta = (ClampMin = "0"))
+	int32 PayloadBufferPool512 = 120;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Regions", meta = (ClampMin = "0"))
+	int32 PayloadBufferPool1k = 120;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Regions", meta = (ClampMin = "0"))
+	int32 PayloadBufferPool2k = 120;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Regions", meta = (ClampMin = "0"))
+	int32 PayloadBufferPool4k = 80;
+
+	/** Wraps every UpdateTextureRegions call in its own render-thread markers and records (bytes, microseconds) for the cost-model fit. Adds commands, so leave it off for performance runs. -STSPerMipTiming=1 turns it on. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Regions")
+	bool bPerMipTiming = false;
+
+	/** In-use slots per resolution that ReadbackMips checks (those that received updates first). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "STS|Regions", meta = (ClampMin = "1"))
+	int32 ReadbackSlotsPerResolution = 4;
 
 	// --- STS|Updates ---
 
@@ -513,6 +551,12 @@ private:
 		double SumRenderMs = 0.0;
 		double SumRHIMs = 0.0;
 		double SumGpuMs = 0.0;
+		double SumRenderRawMs = 0.0;
+		double SumRHIRawMs = 0.0;
+		double SumPresents = 0.0;
+		float AvgRenderRawMs = 0.0f;
+		float AvgRHIRawMs = 0.0f;
+		float AvgPresents = 0.0f;
 		float MaxFrameMs = 0.0f;
 		float MaxGameMs = 0.0f;
 		float MaxRenderMs = 0.0f;
@@ -576,6 +620,37 @@ private:
 		double IssueToVisibleSumMs = 0.0;
 		double IssueToVisibleMaxMs = 0.0;
 		double ReleaseToVisibleMaxMs = 0.0;
+
+		// Phase 3.
+		double UploadGTMs = 0.0;
+		double RTUploadMs = 0.0;
+		/** The whole Regions apply step (slot acquire, commit and the upload calls); Baseline-only columns stay 0 in Regions mode. */
+		double RegionsApplyMs = 0.0;
+		int32 MipCalls = 0;
+		int32 UpdateResourceAfterInit = 0;
+		int32 BufferPoolMisses = 0;
+		int32 UploadFailures = 0;
+	};
+
+	/** Least-squares sums for time = FixedCost + Bytes / Throughput. */
+	struct FCostFit
+	{
+		int64 N = 0;
+		double Sx = 0.0;
+		double Sy = 0.0;
+		double Sxx = 0.0;
+		double Sxy = 0.0;
+		double Syy = 0.0;
+
+		void Add(double X, double Y)
+		{
+			++N;
+			Sx += X;
+			Sy += Y;
+			Sxx += X * X;
+			Sxy += X * Y;
+			Syy += Y * Y;
+		}
 	};
 
 	/** The outcome of one trigger (a burst, or the requests due in one spread frame). */
@@ -638,6 +713,32 @@ private:
 		TArray<float> UpdateResourceGTMs;
 		TArray<float> RTCreateMs[STS::NumBuckets];
 		TArray<float> BuildMs[STS::NumBuckets];
+
+		// Phase 3.
+		int64 UpdateResourceAfterInit = 0;
+		int64 BufferPoolMisses = 0;
+		int64 UploadFailures = 0;
+		int64 ReadbackMipsChecked = 0;
+		int64 ReadbackMipsMismatched = 0;
+		int32 MaxUploadsInFlight = 0;
+		int32 MaxMipCallsPerFrame = 0;
+		TArray<float> ApplyStepGTMs;
+		TArray<float> UploadGTMs;
+		TArray<float> RTUploadMs[STS::NumBuckets];
+		TArray<float> UploadLatencyMs[STS::NumBuckets];
+		FCostFit MipFit;
+
+		// Thread-time capture (STSThreadTimes).
+		int64 ThreadFrames = 0;
+		int64 FramesWithManyPresents = 0;
+		int32 PresentsMax = 0;
+		double PresentsSum = 0.0;
+		double RenderSum = 0.0;
+		double RHISum = 0.0;
+		double RenderRawSum = 0.0;
+		double RHIRawSum = 0.0;
+		float RenderRawMax = 0.0f;
+		float RHIRawMax = 0.0f;
 	};
 
 	/** The request IDs of one burst, so the trace bookmark can be placed on its first apply. */
@@ -646,6 +747,34 @@ private:
 		int64 FirstRequestId = 0;
 		int64 EndRequestId = 0;
 		int32 Number = 0;
+	};
+
+	/** A released response waiting for a Regions slot. */
+	struct FPendingRegionUpload
+	{
+		FSTSRequest Request;
+		TSharedPtr<const FSTSPayload> Source;
+		FSTSPayloadBuffer Buffer;
+		double ReleaseTimeSec = 0.0;
+		/** PoolExhausted was already counted for this upload. */
+		bool bExhaustedCounted = false;
+	};
+
+	/** Shared with the RHI-thread cleanup of an upload's last mip. */
+	struct FUploadTicket
+	{
+		uint64 IssueCycles = 0;
+		int32 Bucket = INDEX_NONE;
+		std::atomic<uint64> CompleteCycles{ 0 };
+		std::atomic<bool> bComplete{ false };
+	};
+
+	/** Regions slot state, kept for every pool member. */
+	struct FRegionsSlot
+	{
+		bool bInitialized = false;
+		/** The resource UpdateResource created; a different one later means something replaced it behind our back. */
+		const FTextureResource* Resource = nullptr;
 	};
 
 	/** A timeline-driven trigger: item k is due at StartSec + k / Rate. */
@@ -682,6 +811,7 @@ private:
 	void CreateTileSlice(int32 MaxTiles);
 	void CreateTile(const FSTSTilePlan& Plan);
 	void FinishCreation();
+	/** The texture of a live tile, or a Regions slot: in Regions and BaselineSingleUse the mips are single-use, and in Regions the one UpdateResource goes through InitializeRegionsSlot. */
 	UTexture2D* CreateTileTexture(int32 Resolution);
 	void EnsureMeshes();
 	void ResolveBaseMaterial();
@@ -699,9 +829,12 @@ private:
 	void UpdateSequence(double NowSec);
 	void BeginSequenceStep(ESTSSequenceStep Step, double NowSec);
 	void FinishSequence();
+	void AccumulateThreadTimeWindow(const FSTSFrameSample& Sample);
+	void GatherThreadTimeSummary(TArray<FString>& OutLines) const;
 	void GatherSummaryHeader(TArray<FString>& OutLines) const;
 	bool GatherRenderSettings(TArray<FString>& OutLines, FString& OutProfileSummary) const;
 	void LogRenderSettings() const;
+	bool IsPieWorld() const;
 
 	// HUD
 	void DrawHud(UCanvas* Canvas, APlayerController* Controller);
@@ -735,7 +868,7 @@ private:
 	void GatherUpdateSummary(TArray<FString>& OutLines) const;
 	void AppendUpdateHud(TArray<TPair<FString, FLinearColor>>& Lines, double NowSec) const;
 
-	// Baseline upload path (STSTestbenchBaseline.cpp)
+	// Baseline upload path (STSTestbenchBaseline.cpp). The pool, slack and consistency code is shared with Regions mode.
 	int32 GetPoolSlack(int32 Bucket, int32 TilesAtBucket) const;
 	void CreatePoolSpares(const int32* TilesPerBucket);
 	void RebuildPoolsFromTiles();
@@ -744,12 +877,31 @@ private:
 	void SubmitBuildJob(FSTSResponse& Response, double NowSec);
 	void ApplyBaselineJobs();
 	bool ApplyBuildJob(FSTSBuildJob& Job);
+	/** Takes the bottom slot of the bucket's FIFO and does the reuse-age accounting; null (and one PoolExhausted count per upload) when the queue is empty. */
+	UTexture2D* TakePooledTexture(int32 Bucket, const FSTSRequest& Request, bool& bInOutExhaustedCounted);
+	/** Puts Texture on the tile, releases its old texture to the FIFO and updates the visual state and the upload statistics. */
+	void CommitTileUpdate(FSTSTile& Tile, UTexture2D* Texture, const FSTSRequest& Request, int32 OldBucket, int32 NewBucket, double ReleaseTimeSec, int64 PayloadBytes);
 	void NoteBurstIssued(int64 FirstRequestId, int64 EndRequestId);
 	void FillBaselineColumns(FSTSFrameSample& Sample);
 	void GatherBaselineSummary(TArray<FString>& OutLines) const;
 	void GatherKeyStats(TArray<FString>& OutLines) const;
 	void AppendBaselineHud(TArray<TPair<FString, FLinearColor>>& Lines) const;
-	bool IsBaselineIdle() const;
+	bool IsUploadPathIdle() const;
+	void RefreshPoolStats();
+
+	// Regions upload path (STSTestbenchRegions.cpp)
+	void EnsureRegionsInfrastructure();
+	void ShutdownRegions();
+	void InitializeRegionsSlot(UTexture2D* Slot);
+	void SubmitRegionsUpload(FSTSResponse& Response, double NowSec);
+	void ReleaseResponseBuffer(const FSTSRequest& Request, FSTSPayloadBuffer&& Buffer);
+	void ApplyRegionsUploads();
+	bool ApplyRegionsUpload(FPendingRegionUpload& Pending);
+	/** time = FixedCost + Bytes / Throughput over (bytes, microseconds) samples. False when the samples cannot be fitted. */
+	static bool SolveCostFit(const FCostFit& Fit, double& OutFixedCostUs, double& OutThroughputGBps, double& OutR2);
+	void FillRegionsColumns(FSTSFrameSample& Sample);
+	void GatherRegionsSummary(TArray<FString>& OutLines) const;
+	void AppendRegionsHud(TArray<TPair<FString, FLinearColor>>& Lines) const;
 
 	// Scenario (STSTestbenchScenario.cpp)
 	void BuildScenarioPreset(ESTSScenarioPreset Preset, TArray<FSTSScenarioStep>& OutSteps) const;
@@ -859,6 +1011,8 @@ private:
 	FSTSTexturePool TexturePool;
 	TUniquePtr<FSTSMipBuilder> Builder;
 	FSTSRenderTimer RenderTimer;
+	FSTSThreadTimeMonitor ThreadTimes;
+	int64 RetainedBulkBytes[STS::NumBuckets] = {};
 	/** Finished jobs in completion order, waiting for an object; jobs that found their queue empty stay here. */
 	TArray<FSTSBuildJob> ApplyQueue;
 	TArray<FSTSBuildJob> FinishedScratch;
@@ -873,6 +1027,27 @@ private:
 	int64 TotalConsistencyMismatches = 0;
 	int32 LoggedUnsafeReuses = 0;
 	int32 LoggedPoolExhausted = 0;
+
+	// --- Phase 3: Regions upload path ---
+
+	int32 PayloadBufferPoolCommandLine = -1;
+	bool bPerMipTimingFromCommandLine = false;
+	TSharedPtr<FSTSPayloadBufferPool, ESPMode::ThreadSafe> BufferPool;
+	int32 BufferPoolSizes[STS::NumBuckets] = {};
+	TUniquePtr<ISTSTextureUploader> Uploader;
+	FSTSRenderTimer UploadTimer;
+	FSTSRenderTimer MipTimer;
+	TMap<const UTexture2D*, FRegionsSlot> RegionsSlots;
+	TArray<FPendingRegionUpload> UploadQueue;
+	TArray<TSharedRef<FUploadTicket, ESPMode::ThreadSafe>> InFlightUploads;
+	TArray<FSTSRenderTimingSample> UploadSamplesScratch;
+	int64 LastBufferPoolMisses = 0;
+	int64 TotalUpdateResourceAfterInit = 0;
+	int64 TotalBufferPoolMisses = 0;
+	int64 TotalUploadFailures = 0;
+	int64 TotalReadbackMismatches = 0;
+	int32 LoggedUploadFailures = 0;
+	float PoolVramMB[STS::NumBuckets] = {};
 
 	TArray<FSTSScenarioStep> ScenarioRuntimeSteps;
 	bool bScenarioRunning = false;

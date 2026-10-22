@@ -2,7 +2,6 @@
 
 #include "STSTexturePool.h"
 
-#include "STSDxt1Generator.h"
 #include "TextureResource.h"
 
 UTexture2D* FSTSTexturePool::CreateSpareTexture(int32 Resolution, bool bSRGB)
@@ -29,18 +28,13 @@ void FSTSTexturePool::Reset()
 		Free[Bucket].Empty();
 		InUse[Bucket] = 0;
 		Spares[Bucket] = 0;
-		RetainedBytes[Bucket] = 0;
 	}
 }
 
-void FSTSTexturePool::AddInUse(UTexture2D* Texture, int32 Bucket, bool bHasMips)
+void FSTSTexturePool::AddInUse(UTexture2D* Texture, int32 Bucket)
 {
 	Members.Add(Texture);
 	++InUse[Bucket];
-	if (bHasMips)
-	{
-		RetainedBytes[Bucket] += FSTSDxt1Generator::GetChainBytes(STS::BucketResolutions[Bucket], STS::BucketResolutions[Bucket]);
-	}
 }
 
 void FSTSTexturePool::AddSpare(UTexture2D* Texture, int32 Bucket)
@@ -69,6 +63,34 @@ void FSTSTexturePool::Release(UTexture2D* Texture, int32 Bucket, uint64 Frame)
 {
 	--InUse[Bucket];
 	Free[Bucket].EmplaceLast(FEntry{ Texture, Frame });
+}
+
+void FSTSTexturePool::ComputeRetainedBytes(int64 (&OutBytes)[STS::NumBuckets]) const
+{
+	for (int64& Bytes : OutBytes)
+	{
+		Bytes = 0;
+	}
+	for (const TObjectPtr<UTexture2D>& Member : Members)
+	{
+		const FTexturePlatformData* PlatformData = Member ? Member->GetPlatformData() : nullptr;
+		if (!PlatformData)
+		{
+			continue;
+		}
+		const int32 Bucket = STS::ResolutionToBucket(PlatformData->SizeX);
+		if (Bucket == INDEX_NONE)
+		{
+			continue;
+		}
+		for (const FTexture2DMipMap& Mip : PlatformData->Mips)
+		{
+			if (Mip.BulkData.IsBulkDataLoaded())
+			{
+				OutBytes[Bucket] += Mip.BulkData.GetBulkDataSize();
+			}
+		}
+	}
 }
 
 void FSTSTexturePool::AddReferencedObjects(FReferenceCollector& Collector)

@@ -10,6 +10,7 @@
 #include "Hash/CityHash.h"
 #include "Math/RandomStream.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "STSTextureUploader.h"
 
 namespace
 {
@@ -159,6 +160,18 @@ void FSTSTerrainServer::SetEpoch(uint32 NewEpoch)
 	Epoch.store(NewEpoch, std::memory_order_release);
 }
 
+void FSTSTerrainServer::SetBufferPool(const TSharedPtr<FSTSPayloadBufferPool, ESPMode::ThreadSafe>& InPool)
+{
+	FScopeLock Lock(&BufferPoolLock);
+	BufferPool = InPool;
+}
+
+TSharedPtr<FSTSPayloadBufferPool, ESPMode::ThreadSafe> FSTSTerrainServer::GetBufferPool() const
+{
+	FScopeLock Lock(&BufferPoolLock);
+	return BufferPool;
+}
+
 void FSTSTerrainServer::Submit(const FSTSRequest& Request, const TSharedRef<const FSTSPayload>& Payload, double NowSec)
 {
 	if (bStopping.load(std::memory_order_acquire))
@@ -245,7 +258,16 @@ void FSTSTerrainServer::ProcessJob(FJob& Job)
 	else
 	{
 		const FSTSPayloadBuffer& Source = Job.Payload->Data;
-		Response.Buffer.SetNumUninitialized(Source.Num());
+		const TSharedPtr<FSTSPayloadBufferPool, ESPMode::ThreadSafe> Pool = GetBufferPool();
+		const int32 Bucket = STS::ResolutionToBucket(Job.Request.Resolution);
+		if (Pool.IsValid() && Bucket != INDEX_NONE)
+		{
+			Response.Buffer = Pool->Acquire(Bucket, Source.Num());
+		}
+		else
+		{
+			Response.Buffer.SetNumUninitialized(Source.Num());
+		}
 		FMemory::Memcpy(Response.Buffer.GetData(), Source.GetData(), Source.Num());
 		if (Job.bCorrupt && Source.Num() > 0)
 		{
@@ -262,6 +284,13 @@ void FSTSTerrainServer::Discard(FSTSResponse& Response)
 	--InFlight;
 	--Admitted;
 	++Counters.StaleDiscarded;
+
+	const TSharedPtr<FSTSPayloadBufferPool, ESPMode::ThreadSafe> Pool = GetBufferPool();
+	const int32 Bucket = STS::ResolutionToBucket(Response.Request.Resolution);
+	if (Pool.IsValid() && Bucket != INDEX_NONE)
+	{
+		Pool->Release(Bucket, MoveTemp(Response.Buffer));
+	}
 	Response.Buffer.Empty();
 }
 

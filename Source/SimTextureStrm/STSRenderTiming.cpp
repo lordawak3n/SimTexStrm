@@ -13,19 +13,21 @@ FSTSRenderTimer::FSTSRenderTimer()
 
 void FSTSRenderTimer::EnqueueBegin() const
 {
-	ENQUEUE_RENDER_COMMAND(STSUpdateResourceBegin)([State = State](FRHICommandListImmediate&)
+	ENQUEUE_RENDER_COMMAND(STSRenderTimerBegin)([State = State](FRHICommandListImmediate&)
 	{
 		State->BeginCycles = FPlatformTime::Cycles64();
 	});
 }
 
-void FSTSRenderTimer::EnqueueEnd(int32 Bucket) const
+void FSTSRenderTimer::EnqueueEnd(int32 Bucket, int64 Bytes, int32 MipIndex) const
 {
-	ENQUEUE_RENDER_COMMAND(STSUpdateResourceEnd)([State = State, Bucket](FRHICommandListImmediate&)
+	ENQUEUE_RENDER_COMMAND(STSRenderTimerEnd)([State = State, Bucket, Bytes, MipIndex](FRHICommandListImmediate&)
 	{
 		FSTSRenderTimingSample Sample;
 		Sample.Bucket = Bucket;
 		Sample.Ms = float(FPlatformTime::ToMilliseconds64(FPlatformTime::Cycles64() - State->BeginCycles));
+		Sample.Bytes = Bytes;
+		Sample.MipIndex = MipIndex;
 		State->Samples.Enqueue(Sample);
 	});
 }

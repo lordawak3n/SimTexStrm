@@ -363,8 +363,8 @@ bool ASTSTestbench::ExecuteScenarioStep(const FSTSScenarioStep& Step, bool bFirs
 		}
 		if (Step.DurationSec > 0.0f && StepElapsedSec >= Step.DurationSec)
 		{
-			UE_LOG(LogSTS, Warning, TEXT("Scenario: WaitForIdle timed out after %.1f s with %d requests still in flight and %d build jobs outstanding."),
-				Step.DurationSec, Server ? Server->GetInFlight() : 0, (Builder ? Builder->GetOutstanding() : 0) + ApplyQueue.Num());
+			UE_LOG(LogSTS, Warning, TEXT("Scenario: WaitForIdle timed out after %.1f s with %d requests still in flight and %d build jobs or uploads outstanding."),
+				Step.DurationSec, Server ? Server->GetInFlight() : 0, (Builder ? Builder->GetOutstanding() : 0) + ApplyQueue.Num() + UploadQueue.Num() + InFlightUploads.Num());
 			return true;
 		}
 		return false;

@@ -8,8 +8,10 @@
 #include "HAL/CriticalSection.h"
 #include "STSDxt1Generator.h"
 
-/** The client-side buffer a response is copied into. Swappable for a pooled buffer in a later phase. */
+/** The client-side buffer a response is copied into. Regions mode takes these from an FSTSPayloadBufferPool. */
 using FSTSPayloadBuffer = TArray<uint8>;
+
+class FSTSPayloadBufferPool;
 
 struct FSTSMipRange
 {
@@ -113,6 +115,9 @@ public:
 	/** Responses of any other epoch are discarded and counted; workers skip their copy. */
 	void SetEpoch(uint32 NewEpoch);
 
+	/** Workers take response buffers from this pool (null: one new allocation per response), and discarded responses return theirs. Safe while requests are in flight. */
+	void SetBufferPool(const TSharedPtr<FSTSPayloadBufferPool, ESPMode::ThreadSafe>& InPool);
+
 	/** Models the response time and queues the copy. Requests over MaxInFlight wait in a backlog until a slot frees. */
 	void Submit(const FSTSRequest& Request, const TSharedRef<const FSTSPayload>& Payload, double NowSec);
 
@@ -145,11 +150,15 @@ private:
 	void Discard(FSTSResponse& Response);
 	bool TryTakeJob(FJob& OutJob);
 	void ProcessJob(FJob& Job);
+	TSharedPtr<FSTSPayloadBufferPool, ESPMode::ThreadSafe> GetBufferPool() const;
 
 	FSTSServerSettings Settings;
 	int32 WorkerCount = 0;
 	std::atomic<uint32> Epoch{ 0 };
 	std::atomic<bool> bStopping{ false };
+
+	mutable FCriticalSection BufferPoolLock;
+	TSharedPtr<FSTSPayloadBufferPool, ESPMode::ThreadSafe> BufferPool;
 
 	FCriticalSection JobLock;
 	TQueue<FJob> Jobs;

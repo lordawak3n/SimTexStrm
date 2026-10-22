@@ -10,7 +10,8 @@ public class SimTextureStrm : ModuleRules
 	
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput" });
 
-		PrivateDependencyModuleNames.AddRange(new string[] { "RenderCore", "RHI", "MeshDescription", "StaticMeshDescription" });
+		// Slate: STSThreadTimes hooks the Slate renderer's present callback to read the thread times of the right present.
+		PrivateDependencyModuleNames.AddRange(new string[] { "RenderCore", "RHI", "MeshDescription", "StaticMeshDescription", "Slate", "SlateCore" });
 
 		// STSGpuMemory queries DXGI video memory usage on the adapter the D3D12 RHI uses.
 		if (Target.Platform == UnrealTargetPlatform.Win64)
@@ -18,9 +19,6 @@ public class SimTextureStrm : ModuleRules
 			PublicSystemLibraries.Add("dxgi.lib");
 		}
 
-		// Uncomment if you are using Slate UI
-		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
-		
 		// Uncomment if you are using online features
 		// PrivateDependencyModuleNames.Add("OnlineSubsystem");
 

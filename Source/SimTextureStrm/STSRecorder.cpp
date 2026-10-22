@@ -19,7 +19,7 @@ namespace
 	constexpr float FrameBudgetMs60 = 16.67f;
 	constexpr float FrameBudgetMs30 = 33.33f;
 
-	const TCHAR* const CsvHeader = TEXT("Frame,TimeSec,FrameMs,GameThreadMs,RenderThreadMs,RHIThreadMs,GpuMs,TilesAlive,TexMB_512,TexMB_1k,TexMB_2k,TexMB_4k,ProcessPhysMB,RHITextureMB,Uploads,UploadMB,CacheHits,PendingRequests,RequestsIssued,ResponsesReleased,ResponseMB,ResponseLatencyAvgMs,ResponseLatencyMaxMs,StaleDiscarded,ChecksumFailures,ConsumerMs,ChecksumMs,IssueMs,BuildMs,BuildQueueDepth,ApplyGTMs,UpdateResourceGTMs,RTCreateMs,Free512,Free1k,Free2k,Free4k,MinReuseAgeFrames,UnsafeReuses,PoolExhausted,IssueToVisibleAvgMs,IssueToVisibleMaxMs,ReleaseToVisibleMaxMs,GpuLocalMemMB\n");
+	const TCHAR* const CsvHeader = TEXT("Frame,TimeSec,FrameMs,GameThreadMs,RenderThreadMs,RHIThreadMs,GpuMs,TilesAlive,TexMB_512,TexMB_1k,TexMB_2k,TexMB_4k,ProcessPhysMB,RHITextureMB,Uploads,UploadMB,CacheHits,PendingRequests,RequestsIssued,ResponsesReleased,ResponseMB,ResponseLatencyAvgMs,ResponseLatencyMaxMs,StaleDiscarded,ChecksumFailures,ConsumerMs,ChecksumMs,IssueMs,BuildMs,BuildQueueDepth,ApplyGTMs,UpdateResourceGTMs,RTCreateMs,Free512,Free1k,Free2k,Free4k,MinReuseAgeFrames,UnsafeReuses,PoolExhausted,IssueToVisibleAvgMs,IssueToVisibleMaxMs,ReleaseToVisibleMaxMs,GpuLocalMemMB,RenderThreadRawMs,RHIThreadRawMs,SlatePresents,RTUploadMs,UploadGTMs,UploadsInFlight,BufferPoolMisses,UpdateResourceAfterInit,PoolVramMB\n");
 
 	void WriteUtf8(FArchive& Writer, const FString& Text)
 	{
@@ -168,7 +168,7 @@ void FSTSRecorder::FlushPending()
 		Text.Reserve(Chunk.Num() * 256);
 		for (const FSTSFrameSample& Row : Chunk)
 		{
-			Text.Appendf(TEXT("%llu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,%d,%.3f,0,%d,%d,%d,%.3f,%.3f,%.3f,%d,%d,%.4f,%.4f,%.4f,%.4f,%d,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.1f\n"),
+			Text.Appendf(TEXT("%llu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,%d,%.3f,0,%d,%d,%d,%.3f,%.3f,%.3f,%d,%d,%.4f,%.4f,%.4f,%.4f,%d,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.1f,%.4f,%.4f,%d,%.4f,%.4f,%d,%d,%d,%.1f\n"),
 				Row.Frame, Row.TimeSec, Row.FrameMs, Row.GameThreadMs, Row.RenderThreadMs, Row.RHIThreadMs, Row.GpuMs,
 				Row.TilesAlive, Row.TexMB[0], Row.TexMB[1], Row.TexMB[2], Row.TexMB[3], Row.ProcessPhysMB, Row.RHITextureMB,
 				Row.Uploads, Row.UploadMB,
@@ -177,7 +177,9 @@ void FSTSRecorder::FlushPending()
 				Row.BuildMs, Row.BuildQueueDepth, Row.ApplyGTMs, Row.UpdateResourceGTMs, Row.RTCreateMs,
 				Row.FreeObjects[0], Row.FreeObjects[1], Row.FreeObjects[2], Row.FreeObjects[3],
 				Row.MinReuseAgeFrames, Row.UnsafeReuses, Row.PoolExhausted,
-				Row.IssueToVisibleAvgMs, Row.IssueToVisibleMaxMs, Row.ReleaseToVisibleMaxMs, Row.GpuLocalMemMB);
+				Row.IssueToVisibleAvgMs, Row.IssueToVisibleMaxMs, Row.ReleaseToVisibleMaxMs, Row.GpuLocalMemMB,
+				Row.RenderThreadRawMs, Row.RHIThreadRawMs, Row.SlatePresents, Row.RTUploadMs, Row.UploadGTMs, Row.UploadsInFlight,
+				Row.BufferPoolMisses, Row.UpdateResourceAfterInit, Row.PoolVramMB);
 		}
 		WriteUtf8(*Writer, Text);
 	});

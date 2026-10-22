@@ -223,7 +223,7 @@ void ASTSTestbench::BeginPlay()
 		const int64 ModeValue = StaticEnum<ESTSUploadMode>()->GetValueByNameString(ModeName);
 		if (ModeValue == INDEX_NONE)
 		{
-			UE_LOG(LogSTS, Error, TEXT("-StsMode=%s is not an upload mode (LogicalOnly or Baseline); ignored."), *ModeName);
+			UE_LOG(LogSTS, Error, TEXT("-StsMode=%s is not an upload mode (LogicalOnly, Baseline, BaselineSingleUse or Regions); ignored."), *ModeName);
 		}
 		else
 		{
@@ -235,9 +235,23 @@ void ASTSTestbench::BeginPlay()
 	FParse::Value(FCommandLine::Get(), TEXT("STSBuilderThreads="), BaselineBuilderThreads);
 	FParse::Value(FCommandLine::Get(), TEXT("STSSafeReuseFrames="), SafeReuseFrames);
 	FParse::Value(FCommandLine::Get(), TEXT("STSRunTag="), RunTag);
+	if (FParse::Value(FCommandLine::Get(), TEXT("STSBufferPool="), PayloadBufferPoolCommandLine))
+	{
+		PayloadBufferPoolCommandLine = FMath::Max(0, PayloadBufferPoolCommandLine);
+	}
+	int32 PerMipOverride = 0;
+	if (FParse::Value(FCommandLine::Get(), TEXT("STSPerMipTiming="), PerMipOverride))
+	{
+		bPerMipTiming = PerMipOverride != 0;
+	}
 
 	UpdateStream.Initialize(UpdateSeed);
 	ResetTriggerState();
+
+	if (!ThreadTimes.Start())
+	{
+		UE_LOG(LogSTS, Warning, TEXT("No Slate renderer: RenderThreadMs and RHIThreadMs come from the engine globals, which are unreliable when several windows are presented per frame."));
+	}
 
 	LogRenderSettings();
 	ResolveBaseMaterial();
@@ -296,7 +310,9 @@ void ASTSTestbench::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	// Stops the workers and frees every buffer still queued, in flight or waiting in the delay line.
 	ShutdownServer();
 	ShutdownBuilder();
+	ShutdownRegions();
 	TexturePool.Reset();
+	ThreadTimes.Stop();
 
 	bCreationInProgress = false;
 	bAutoRecordPending = false;
@@ -324,9 +340,13 @@ void ASTSTestbench::Tick(float DeltaSeconds)
 	}
 
 	ConsumeResponses(NowSec);
-	if (ActiveUploadMode == ESTSUploadMode::Baseline)
+	if (STS::IsBaselineFamily(ActiveUploadMode))
 	{
 		ApplyBaselineJobs();
+	}
+	else if (ActiveUploadMode == ESTSUploadMode::Regions)
+	{
+		ApplyRegionsUploads();
 	}
 	UpdateScenario(NowSec);
 	UpdateTimelines(NowSec);
@@ -574,9 +594,20 @@ void ASTSTestbench::CreateTiles()
 	BuildTilePlan();
 
 	ActiveUploadMode = bUploadModeFromCommandLine ? CommandLineUploadMode : UploadMode;
-	if (ActiveUploadMode == ESTSUploadMode::Baseline)
+	const bool bBaselineFamily = STS::IsBaselineFamily(ActiveUploadMode);
+	const bool bRegions = ActiveUploadMode == ESTSUploadMode::Regions;
+	if (bBaselineFamily || bRegions)
 	{
-		EnsureBuilder();
+		if (bBaselineFamily)
+		{
+			EnsureBuilder();
+			ShutdownRegions();
+		}
+		else
+		{
+			ShutdownBuilder();
+			EnsureRegionsInfrastructure();
+		}
 		int32 PlannedPerBucket[STS::NumBuckets] = {};
 		for (const FSTSTilePlan& Plan : TilePlans)
 		{
@@ -591,6 +622,7 @@ void ASTSTestbench::CreateTiles()
 	else
 	{
 		ShutdownBuilder();
+		ShutdownRegions();
 	}
 
 	CreationPrepSec = FPlatformTime::Seconds() - StartSec;
@@ -666,9 +698,9 @@ void ASTSTestbench::CreateTile(const FSTSTilePlan& Plan)
 	{
 		++TileCountsPerBucket[Bucket];
 		++LogicalCountsPerBucket[Bucket];
-		if (ActiveUploadMode == ESTSUploadMode::Baseline)
+		if (STS::UpdatesVisuals(ActiveUploadMode))
 		{
-			TexturePool.AddInUse(Texture, Bucket, true);
+			TexturePool.AddInUse(Texture, Bucket);
 		}
 	}
 	else
@@ -694,12 +726,19 @@ UTexture2D* ASTSTestbench::CreateTileTexture(int32 Resolution)
 		return nullptr;
 	}
 
+	// Single-use mips let the FTexture2DResource take the memory instead of copying it; the flag goes on after the fill because Unlock frees single-use data.
+	const bool bSingleUse = ActiveUploadMode == ESTSUploadMode::BaselineSingleUse || ActiveUploadMode == ESTSUploadMode::Regions;
+
 	FTexturePlatformData* PlatformData = Texture->GetPlatformData();
 	{
 		FTexture2DMipMap& BaseMip = PlatformData->Mips[0];
 		void* Dest = BaseMip.BulkData.Lock(LOCK_READ_WRITE);
 		FMemory::Memcpy(Dest, Chain.Mips[0].GetData(), Chain.Mips[0].Num());
 		BaseMip.BulkData.Unlock();
+		if (bSingleUse)
+		{
+			BaseMip.BulkData.SetBulkDataFlags(BULKDATA_SingleUse);
+		}
 	}
 	for (int32 MipIndex = 1; MipIndex < Chain.Mips.Num(); ++MipIndex)
 	{
@@ -710,11 +749,20 @@ UTexture2D* ASTSTestbench::CreateTileTexture(int32 Resolution)
 		void* Dest = Mip->BulkData.Realloc(Chain.Mips[MipIndex].Num());
 		FMemory::Memcpy(Dest, Chain.Mips[MipIndex].GetData(), Chain.Mips[MipIndex].Num());
 		Mip->BulkData.Unlock();
+		if (bSingleUse)
+		{
+			Mip->BulkData.SetBulkDataFlags(BULKDATA_SingleUse);
+		}
 	}
 
 	Texture->SRGB = bSRGB;
 	Texture->LODGroup = TEXTUREGROUP_World;
 	Texture->NeverStream = true;
+	if (ActiveUploadMode == ESTSUploadMode::Regions)
+	{
+		InitializeRegionsSlot(Texture);
+	}
+	else
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(STS_UpdateResource);
 		Texture->UpdateResource();
@@ -761,6 +809,12 @@ void ASTSTestbench::DestroyTiles()
 	Tiles.Empty();
 	TexturePool.Reset();
 	BurstBookmarks.Reset();
+	RegionsSlots.Reset();
+	for (FPendingRegionUpload& Pending : UploadQueue)
+	{
+		ReleaseResponseBuffer(Pending.Request, MoveTemp(Pending.Buffer));
+	}
+	UploadQueue.Reset();
 	FMemory::Memzero(TileCountsPerBucket);
 	TileCountsOtherResolution = 0;
 	ResetLogicalState();
@@ -818,6 +872,8 @@ void ASTSTestbench::RegenerateTextures()
 	}
 	EnsurePayloadLibrary(Needed);
 
+	// Regions slots are never updated with UpdateResource again, so every slot is replaced by a new one and the pools are re-created.
+	RegionsSlots.Reset();
 	for (FSTSTile& Tile : Tiles)
 	{
 		UTexture2D* Texture = CreateTileTexture(Tile.Resolution);
@@ -825,10 +881,11 @@ void ASTSTestbench::RegenerateTextures()
 		{
 			Tile.Texture = Texture;
 			Tile.VisualVariant = PayloadLibraryVariant;
+			Tile.UpdateCount = 0;
 			Tile.Material->SetTextureParameterValue(TextureParameterName, Texture);
 		}
 	}
-	if (ActiveUploadMode == ESTSUploadMode::Baseline)
+	if (STS::UpdatesVisuals(ActiveUploadMode) && !Tiles.IsEmpty())
 	{
 		RebuildPoolsFromTiles();
 	}
@@ -983,8 +1040,20 @@ void ASTSTestbench::OnEndFrame()
 	LastEndFrameSec = NowSec;
 
 	Sample.GameThreadMs = CyclesToMs(GGameThreadTime);
-	Sample.RenderThreadMs = CyclesToMs(GRenderThreadTime);
-	Sample.RHIThreadMs = CyclesToMs(GRHIThreadTime);
+	Sample.RenderThreadRawMs = CyclesToMs(GRenderThreadTime);
+	Sample.RHIThreadRawMs = CyclesToMs(GRHIThreadTime);
+	if (ThreadTimes.IsRunning())
+	{
+		const FSTSThreadTimeReading Reading = ThreadTimes.Read();
+		Sample.RenderThreadMs = CyclesToMs(Reading.RenderCycles);
+		Sample.RHIThreadMs = CyclesToMs(Reading.RHICycles);
+		Sample.SlatePresents = Reading.Presents;
+	}
+	else
+	{
+		Sample.RenderThreadMs = Sample.RenderThreadRawMs;
+		Sample.RHIThreadMs = Sample.RHIThreadRawMs;
+	}
 	Sample.GpuMs = CyclesToMs(RHIGetGPUFrameCycles(0));
 
 	if (NowSec - LastMemorySampleSec >= MemorySampleIntervalSec)
@@ -996,6 +1065,7 @@ void ASTSTestbench::OnEndFrame()
 		RHIGetTextureMemoryStats(TextureStats);
 		CachedRHITextureMB = float((TextureStats.StreamingMemorySize + TextureStats.NonStreamingMemorySize) / STS::MegaByte);
 		CachedGpuLocalMemMB = STSGpuMemory::QueryLocalUsageMB();
+		RefreshPoolStats();
 	}
 	Sample.ProcessPhysMB = CachedProcessPhysMB;
 	Sample.RHITextureMB = CachedRHITextureMB;
@@ -1012,8 +1082,23 @@ void ASTSTestbench::OnEndFrame()
 	AccumulateHudStats(NowSec, Sample);
 	if (Recorder.IsRecording())
 	{
+		AccumulateThreadTimeWindow(Sample);
 		Recorder.AddSample(NowSec, Sample);
 	}
+}
+
+void ASTSTestbench::AccumulateThreadTimeWindow(const FSTSFrameSample& Sample)
+{
+	++Window.ThreadFrames;
+	Window.PresentsSum += Sample.SlatePresents;
+	Window.PresentsMax = FMath::Max(Window.PresentsMax, Sample.SlatePresents);
+	Window.FramesWithManyPresents += Sample.SlatePresents > 1 ? 1 : 0;
+	Window.RenderSum += Sample.RenderThreadMs;
+	Window.RHISum += Sample.RHIThreadMs;
+	Window.RenderRawSum += Sample.RenderThreadRawMs;
+	Window.RHIRawSum += Sample.RHIThreadRawMs;
+	Window.RenderRawMax = FMath::Max(Window.RenderRawMax, Sample.RenderThreadRawMs);
+	Window.RHIRawMax = FMath::Max(Window.RHIRawMax, Sample.RHIThreadRawMs);
 }
 
 void ASTSTestbench::AccumulateHudStats(double NowSec, const FSTSFrameSample& Sample)
@@ -1024,6 +1109,9 @@ void ASTSTestbench::AccumulateHudStats(double NowSec, const FSTSFrameSample& Sam
 	HudStats.SumRenderMs += Sample.RenderThreadMs;
 	HudStats.SumRHIMs += Sample.RHIThreadMs;
 	HudStats.SumGpuMs += Sample.GpuMs;
+	HudStats.SumRenderRawMs += Sample.RenderThreadRawMs;
+	HudStats.SumRHIRawMs += Sample.RHIThreadRawMs;
+	HudStats.SumPresents += Sample.SlatePresents;
 	HudStats.MaxFrameMs = FMath::Max(HudStats.MaxFrameMs, Sample.FrameMs);
 	HudStats.MaxGameMs = FMath::Max(HudStats.MaxGameMs, Sample.GameThreadMs);
 	HudStats.MaxRenderMs = FMath::Max(HudStats.MaxRenderMs, Sample.RenderThreadMs);
@@ -1062,6 +1150,9 @@ void ASTSTestbench::AccumulateHudStats(double NowSec, const FSTSFrameSample& Sam
 	HudStats.AvgRenderMs = float(HudStats.SumRenderMs * InvFrames);
 	HudStats.AvgRHIMs = float(HudStats.SumRHIMs * InvFrames);
 	HudStats.AvgGpuMs = float(HudStats.SumGpuMs * InvFrames);
+	HudStats.AvgRenderRawMs = float(HudStats.SumRenderRawMs * InvFrames);
+	HudStats.AvgRHIRawMs = float(HudStats.SumRHIRawMs * InvFrames);
+	HudStats.AvgPresents = float(HudStats.SumPresents * InvFrames);
 	HudStats.ShownMaxFrameMs = HudStats.MaxFrameMs;
 	HudStats.ShownMaxGameMs = HudStats.MaxGameMs;
 	HudStats.ShownMaxRenderMs = HudStats.MaxRenderMs;
@@ -1071,6 +1162,7 @@ void ASTSTestbench::AccumulateHudStats(double NowSec, const FSTSFrameSample& Sam
 	HudStats.WindowStartSec = NowSec;
 	HudStats.Frames = 0;
 	HudStats.SumFrameMs = HudStats.SumGameMs = HudStats.SumRenderMs = HudStats.SumRHIMs = HudStats.SumGpuMs = 0.0;
+	HudStats.SumRenderRawMs = HudStats.SumRHIRawMs = HudStats.SumPresents = 0.0;
 	HudStats.MaxFrameMs = HudStats.MaxGameMs = HudStats.MaxRenderMs = HudStats.MaxRHIMs = HudStats.MaxGpuMs = 0.0f;
 }
 
@@ -1214,6 +1306,44 @@ void ASTSTestbench::FinishSequence()
 
 // --- Summary and render settings ---
 
+bool ASTSTestbench::IsPieWorld() const
+{
+	const UWorld* World = GetWorld();
+	return World && World->WorldType == EWorldType::PIE;
+}
+
+void ASTSTestbench::GatherThreadTimeSummary(TArray<FString>& OutLines) const
+{
+	if (Window.ThreadFrames == 0)
+	{
+		return;
+	}
+
+	const double Frames = double(Window.ThreadFrames);
+	OutLines.Add(FString());
+	OutLines.Add(TEXT("Thread-time capture (Phase 3 section 1):"));
+	OutLines.Add(FString::Printf(TEXT("  Slate presents per frame: avg %.2f, max %d; %lld of %lld frames (%.1f%%) had more than one"),
+		Window.PresentsSum / Frames, Window.PresentsMax, Window.FramesWithManyPresents, Window.ThreadFrames, 100.0 * Window.FramesWithManyPresents / Frames));
+	OutLines.Add(FString::Printf(TEXT("  Capture: %s"), ThreadTimes.IsRunning() ? TEXT("FSlateRenderer::OnBackBufferReadyToPresent hook, first present of each frame") : TEXT("NONE (no Slate renderer); the engine globals are used")));
+	OutLines.Add(FString::Printf(TEXT("  RenderThreadMs  avg %.3f (corrected, in the table below) | engine global avg %.3f, max %.3f"), Window.RenderSum / Frames, Window.RenderRawSum / Frames, Window.RenderRawMax));
+	OutLines.Add(FString::Printf(TEXT("  RHIThreadMs     avg %.3f (corrected, in the table below) | engine global avg %.3f, max %.3f"), Window.RHISum / Frames, Window.RHIRawSum / Frames, Window.RHIRawMax));
+
+	const bool bMultiple = Window.FramesWithManyPresents > Window.ThreadFrames / 2;
+	if (!ThreadTimes.IsRunning())
+	{
+		OutLines.Add(TEXT("  Verdict: not corrected. With more than one window presented per frame the engine globals read a few microseconds; run standalone (-game), where one window is presented."));
+	}
+	else if (bMultiple)
+	{
+		OutLines.Add(TEXT("  Verdict: several windows are presented per frame (editor / PIE). PresentWindow_RenderThread overwrites GRenderThreadTime and GRHIThreadTime on every present with the time since the previous one,"));
+		OutLines.Add(TEXT("           so the engine globals and stat unit hold the interval between the last two presents. The corrected columns hold the first present's value, which spans the frame."));
+	}
+	else
+	{
+		OutLines.Add(TEXT("  Verdict: one window is presented per frame, so the engine globals are valid; the corrected values should equal them (lagging at most one frame)."));
+	}
+}
+
 bool ASTSTestbench::GatherRenderSettings(TArray<FString>& OutLines, FString& OutProfileSummary) const
 {
 	IConsoleManager& ConsoleManager = IConsoleManager::Get();
@@ -1292,6 +1422,9 @@ void ASTSTestbench::GatherSummaryHeader(TArray<FString>& OutLines) const
 		OutLines.Add(FString::Printf(TEXT("Upload mode: %s (%s)"), *STS::EnumToString(Mode),
 			bUploadModeFromCommandLine ? TEXT("-StsMode on the command line") : TEXT("UploadMode knob")));
 	}
+	OutLines.Add(FString::Printf(TEXT("Checksums: %s%s"), bVerifyChecksums ? TEXT("On") : TEXT("Off"),
+		bVerifyChecksums ? TEXT(" (harness cost on the game thread; not a performance run)") : TEXT("")));
+	OutLines.Add(FString::Printf(TEXT("Run context: %s"), IsPieWorld() ? TEXT("PIE (not comparable)") : TEXT("standalone game")));
 
 	FIntPoint ViewportSize = FIntPoint::ZeroValue;
 	if (GEngine && GEngine->GameViewport && GEngine->GameViewport->Viewport)
@@ -1323,12 +1456,16 @@ void ASTSTestbench::GatherSummaryHeader(TArray<FString>& OutLines) const
 
 	GatherUpdateSummary(OutLines);
 	GatherBaselineSummary(OutLines);
+	GatherRegionsSummary(OutLines);
+	GatherThreadTimeSummary(OutLines);
+	GatherKeyStats(OutLines);
 
 	OutLines.Add(TEXT("Timing sources:"));
 	OutLines.Add(TEXT("  FrameMs: wall-clock delta between consecutive FCoreDelegates::OnEndFrame calls (no latency)."));
 	OutLines.Add(TEXT("  GameThreadMs: GGameThreadTime, busy time excluding waits; set in FViewport::Draw, so it covers the frame just ended."));
-	OutLines.Add(TEXT("  RenderThreadMs: GRenderThreadTime, busy time excluding idle; set after present on the render thread, lags about 1 frame."));
-	OutLines.Add(TEXT("  RHIThreadMs: GRHIThreadTime, busy time excluding waits; lags about 1 frame, 0 without an RHI thread."));
+	OutLines.Add(TEXT("  RenderThreadMs: GRenderThreadTime as left by the FIRST Slate present of the frame (STSThreadTimes); busy time excluding idle, lags about 1 frame."));
+	OutLines.Add(TEXT("  RHIThreadMs: GRHIThreadTime as left by the same present, read on the RHI thread; lags about 1 frame, 0 without an RHI thread."));
+	OutLines.Add(TEXT("  RenderThreadRawMs, RHIThreadRawMs (CSV only): the engine globals as stat unit reads them, overwritten by every present of the frame."));
 	OutLines.Add(TEXT("  GpuMs: RHIGetGPUFrameCycles(0), timestamp-query history; lags 1-2 frames."));
 	if (Window.Issued > 0 || Window.Released > 0)
 	{
@@ -1348,9 +1485,12 @@ void ASTSTestbench::DrawHud(UCanvas* Canvas, APlayerController* /*Controller*/)
 	const double NowSec = FPlatformTime::Seconds();
 
 	TArray<TPair<FString, FLinearColor>> Lines;
-	Lines.Emplace(FString::Printf(TEXT("STS Phase 2 (%s) | %.1f fps | frame %.2f ms (max %.2f)"), *STS::EnumToString(ActiveUploadMode), HudStats.Fps, HudStats.AvgFrameMs, HudStats.ShownMaxFrameMs), FLinearColor::White);
+	Lines.Emplace(FString::Printf(TEXT("STS Phase 3 (%s) | %.1f fps | frame %.2f ms (max %.2f)"), *STS::EnumToString(ActiveUploadMode), HudStats.Fps, HudStats.AvgFrameMs, HudStats.ShownMaxFrameMs), FLinearColor::White);
 	Lines.Emplace(FString::Printf(TEXT("Game %.2f (%.2f) | Render %.2f (%.2f) | RHI %.2f (%.2f) | GPU %.2f (%.2f) ms, avg (max)"),
 		HudStats.AvgGameMs, HudStats.ShownMaxGameMs, HudStats.AvgRenderMs, HudStats.ShownMaxRenderMs, HudStats.AvgRHIMs, HudStats.ShownMaxRHIMs, HudStats.AvgGpuMs, HudStats.ShownMaxGpuMs), FLinearColor::White);
+	Lines.Emplace(FString::Printf(TEXT("Thread times (Render, RHI) above are from the first Slate present | engine globals (stat unit): Render %.2f, RHI %.2f ms | presents/frame %.1f%s%s"),
+		HudStats.AvgRenderRawMs, HudStats.AvgRHIRawMs, HudStats.AvgPresents, ThreadTimes.IsRunning() ? TEXT("") : TEXT(" | NO HOOK: values above are the engine globals"),
+		IsPieWorld() ? TEXT(" | PIE (not comparable)") : TEXT("")), HudStats.AvgPresents > 1.5f || IsPieWorld() ? FLinearColor::Yellow : FLinearColor::White);
 
 	FString TileLine = FString::Printf(TEXT("Tiles alive: %d"), Tiles.Num());
 	for (int32 Bucket = STS::NumBuckets - 1; Bucket >= 0; --Bucket)
@@ -1381,6 +1521,7 @@ void ASTSTestbench::DrawHud(UCanvas* Canvas, APlayerController* /*Controller*/)
 
 	AppendUpdateHud(Lines, NowSec);
 	AppendBaselineHud(Lines);
+	AppendRegionsHud(Lines);
 
 	if (NowSec - LastProfileRefreshSec >= 1.0)
 	{

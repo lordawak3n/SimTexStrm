@@ -53,6 +53,22 @@ struct FSTSFrameSample
 	float ReleaseToVisibleMaxMs = 0.0f;
 	/** Negative when the RHI is not D3D12 or the query failed. */
 	float GpuLocalMemMB = -1.0f;
+
+	// Phase 3 columns, appended. RenderThreadMs and RHIThreadMs now come from the right Slate present (STSThreadTimes); the Raw columns are the engine globals stat unit reads.
+	float RenderThreadRawMs = 0.0f;
+	float RHIThreadRawMs = 0.0f;
+	/** Slate windows presented in the last completed frame. */
+	int32 SlatePresents = 0;
+	/** Regions mode: render-thread time between the markers around each texture's uploads; the samples arrive about one frame late. */
+	float RTUploadMs = 0.0f;
+	/** Regions mode: game-thread time of the UpdateTextureRegions calls this frame. */
+	float UploadGTMs = 0.0f;
+	/** Regions mode: uploads issued and not yet complete at the end of the frame. */
+	int32 UploadsInFlight = 0;
+	int32 BufferPoolMisses = 0;
+	int32 UpdateResourceAfterInit = 0;
+	/** Regions mode: nominal mip-chain bytes of every pool slot. */
+	float PoolVramMB = 0.0f;
 };
 
 struct FSTSColumnStats

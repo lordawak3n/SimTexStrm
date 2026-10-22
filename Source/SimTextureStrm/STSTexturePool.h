@@ -28,8 +28,8 @@ public:
 
 	void Reset();
 
-	/** Registers a tile's current texture. bHasMips is whether its PlatformData holds a mip chain. */
-	void AddInUse(UTexture2D* Texture, int32 Bucket, bool bHasMips);
+	/** Registers a tile's current texture. */
+	void AddInUse(UTexture2D* Texture, int32 Bucket);
 
 	/** Registers a spare and puts it on the top of its queue. */
 	void AddSpare(UTexture2D* Texture, int32 Bucket);
@@ -40,14 +40,16 @@ public:
 	/** Puts a texture that left a tile on the top of its queue. */
 	void Release(UTexture2D* Texture, int32 Bucket, uint64 Frame);
 
-	void AddRetainedBytes(int32 Bucket, int64 Delta) { RetainedBytes[Bucket] += Delta; }
-
 	int32 GetNumFree(int32 Bucket) const { return Free[Bucket].Num(); }
 	int32 GetNumInUse(int32 Bucket) const { return InUse[Bucket]; }
 	int32 GetNumSpares(int32 Bucket) const { return Spares[Bucket]; }
+	int32 GetNumMembers(int32 Bucket) const { return InUse[Bucket] + Free[Bucket].Num(); }
 
-	/** CPU memory held by the mips in the PlatformData of every member of the bucket, free or in use. */
-	int64 GetRetainedBytes(int32 Bucket) const { return RetainedBytes[Bucket]; }
+	/**
+	 * CPU memory held by the mip bulk data of every member of each bucket, free or in use: the size of every mip whose bulk data is still loaded.
+	 * Walks the members, so it reflects BULKDATA_SingleUse consumption (a consumed mip keeps its size but no longer holds memory).
+	 */
+	void ComputeRetainedBytes(int64 (&OutBytes)[STS::NumBuckets]) const;
 
 	//~ Begin FGCObject Interface
 	virtual void AddReferencedObjects(FReferenceCollector& Collector) override;
@@ -65,5 +67,4 @@ private:
 	TDeque<FEntry> Free[STS::NumBuckets];
 	int32 InUse[STS::NumBuckets] = {};
 	int32 Spares[STS::NumBuckets] = {};
-	int64 RetainedBytes[STS::NumBuckets] = {};
 };

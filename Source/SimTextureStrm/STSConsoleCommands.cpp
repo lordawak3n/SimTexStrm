@@ -223,12 +223,23 @@ namespace
 
 	FAutoConsoleCommandWithWorldAndArgs CheckConsistencyCommand(
 		TEXT("sts.Check.Consistency"),
-		TEXT("Checks every tile (visual state equals logical state in Baseline mode, texture size equals visual resolution, MID texture is the tile's texture) and logs the mismatches."),
+		TEXT("Checks every tile (visual state equals logical state in every mode that updates visuals, texture size equals visual resolution, MID texture is the tile's texture, a Regions slot kept its GPU resource) and logs the mismatches."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
 		{
 			if (ASTSTestbench* Testbench = FindTestbench(World, TEXT("sts.Check.Consistency")))
 			{
 				Testbench->CheckConsistency();
+			}
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CheckReadbackMipsCommand(
+		TEXT("sts.Check.ReadbackMips"),
+		TEXT("sts.Check.ReadbackMips [Resolution]: reads every mip of a few in-use slots per resolution back from the GPU and compares it with the payload the slot should hold. 0 or no argument checks every resolution. Stalls the GPU."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			if (ASTSTestbench* Testbench = FindTestbench(World, TEXT("sts.Check.ReadbackMips")))
+			{
+				Testbench->RunReadbackMips(Args.IsValidIndex(0) ? FCString::Atoi(*Args[0]) : 0);
 			}
 		}));
 }
